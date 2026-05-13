@@ -37,8 +37,8 @@ Harvey automates Disaster Recovery across two Rancher-managed KubeVirt (SUSE Vir
 pip install --user pipx
 pipx ensurepath
 
-# Install Harvey from the latest GitHub release
-pipx install "https://github.com/abonillabeeche/harvey/releases/latest/download/harvey-0.1.0-py3-none-any.whl"
+# Install Harvey directly from the repo
+pipx install git+https://github.com/abonillabeeche/harvey.git
 ```
 
 After installation, run `harvey --help` — no virtual environment activation needed.
@@ -46,7 +46,15 @@ After installation, run `harvey --help` — no virtual environment activation ne
 ### Alternative: pip
 
 ```bash
-pip install "https://github.com/abonillabeeche/harvey/releases/latest/download/harvey-0.1.0-py3-none-any.whl"
+pip install git+https://github.com/abonillabeeche/harvey.git
+```
+
+### Specific version from a release
+
+Download the `.whl` from the [Releases page](https://github.com/abonillabeeche/harvey/releases) and install it directly:
+
+```bash
+pipx install harvey-X.Y.Z-py3-none-any.whl
 ```
 
 ### From source
@@ -313,6 +321,20 @@ harvey --debug plan run production-dr --dry-run
 5. Original site recovers — fail back
    harvey failover all --source dr --destination primary
 ```
+
+---
+
+## Releasing
+
+To publish a new release, tag the commit and push the tag. GitHub Actions builds the wheel and creates the release automatically:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow attaches `harvey-X.Y.Z-py3-none-any.whl` and the source tarball to the GitHub Release.
+Remember to update `version` in `pyproject.toml` and `src/harvey/__init__.py` before tagging.
 
 ---
 
