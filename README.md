@@ -28,25 +28,37 @@ Harvey automates Disaster Recovery across two Rancher-managed KubeVirt (SUSE Vir
 
 ## Installation
 
-### Recommended: pipx (no manual venv required)
+### Recommended: uv
 
-[pipx](https://pipx.pypa.io) installs CLI tools in isolated environments invisibly — you just get a `harvey` command.
+[uv](https://docs.astral.sh/uv/) manages CLI tools in isolated environments and bundles its own Python — no venv setup, no Homebrew Python conflicts.
+
+```bash
+# Install uv if you don't have it
+brew install uv        # macOS
+# or: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install Harvey
+uv tool install git+https://github.com/abonillabeeche/harvey.git
+```
+
+After installation, run `harvey --help`.
+
+### Upgrading
+
+```bash
+uv tool upgrade harvey
+```
+
+### Alternative: pipx
 
 ```bash
 # Install pipx if you don't have it
-pip install --user pipx
-pipx ensurepath
+pip install --user pipx && pipx ensurepath
 
-# Install Harvey directly from the repo
 pipx install git+https://github.com/abonillabeeche/harvey.git
-```
 
-After installation, run `harvey --help` — no virtual environment activation needed.
-
-### Alternative: pip
-
-```bash
-pip install git+https://github.com/abonillabeeche/harvey.git
+# Upgrade
+pipx upgrade harvey
 ```
 
 ### Specific version from a release
@@ -54,7 +66,7 @@ pip install git+https://github.com/abonillabeeche/harvey.git
 Download the `.whl` from the [Releases page](https://github.com/abonillabeeche/harvey/releases) and install it directly:
 
 ```bash
-pipx install harvey-X.Y.Z-py3-none-any.whl
+uv tool install harvey-X.Y.Z-py3-none-any.whl
 ```
 
 ### From source
