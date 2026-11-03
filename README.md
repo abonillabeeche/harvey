@@ -123,7 +123,8 @@ defaults:                                  # so --source/--destination can be om
 
 replication:
   policy: MirrorAllSnapshots               # async SnapMirror policy (Trident supports async only)
-  schedule: 5min                           # ONTAP schedule name; sets the RPO for unplanned failovers
+  schedule: 5min                           # ONTAP schedule name; sets the RPO for unplanned failovers.
+                                           # 5 minutes is NetApp's supported minimum (1 min works but is unsupported).
   storage_class_map: {}                    # source SC -> DR SC when the names differ
   max_lag_seconds: 900                     # health-check threshold
   timeouts: {stop: 300, start: 600, tmr: 300, transfer: 1800, stall: 120}
@@ -241,8 +242,9 @@ harvey failback  -n prod db-1 app-1                 # back home, replication pri
 
 ## Known limitations
 
-- **Async only.** Trident TMRs support asynchronous SnapMirror policies only. The ONTAP `Sync` policy works
-  between the clusters but cannot be managed through Trident.
+- **Async only.** Trident TMRs support asynchronous SnapMirror policies only, with a supported minimum schedule of
+  5 minutes. The ONTAP `Sync` policy works between the clusters but has no Trident integration (NetApp's zero-RPO
+  answer is MetroCluster). Keep the array's concurrent-transfer limit (100 or 250, by platform) in mind at scale.
 - **Per-volume consistency.** Each disk is its own SnapMirror relationship; after an *unplanned* failover the disks
   of one VM can come from different points in time (seen: one disk 1 min older than the others). Planned failovers
   are unaffected (VM stopped + final update). ONTAP consistency groups are not available through Trident.
