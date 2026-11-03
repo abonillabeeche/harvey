@@ -4,25 +4,45 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Release](https://img.shields.io/github/v/release/abonillabeeche/harvey)](https://github.com/abonillabeeche/harvey/releases)
 
-Harvey automates Disaster Recovery across two Rancher-managed KubeVirt (SUSE Virtualization / Harvester) clusters.
+Harvey automates storage-aware Disaster Recovery of virtual machines between two KubeVirt
+(SUSE Virtualization / Harvester) clusters:
+
+- **Disks** are replicated by **NetApp ONTAP SnapMirror**, driven through Trident
+  `TridentMirrorRelationship` (TMR) objects, so the replica volumes are normal PVCs on the DR cluster.
+- **Metadata** (the VM spec, cloud-init / credential Secrets, ConfigMaps, NetworkAttachmentDefinitions) is
+  copied by Harvey. The replica VM sits on the DR cluster, stopped.
+- **Failover** = stop on source → final SnapMirror update → promote the replica volumes → start on DR
+  (lossless when planned). **Unplanned** failover promotes the last replicated data and reports the data loss
+  window. **Reprotect** reverse-resyncs; **failback** = planned failover back + reprotect.
+
+Who is primary is never stored locally: Harvey derives it from labels on the VMs and the TMR states on both
+clusters.
 
 ---
 
 ## What Harvey does
 
-| Capability |
-|---|
-| Compare VM state across both sites |
-| Ordered stop → verify → start failover |
-| Priority groups with startup delays |
-| Recovery Plans (YAML runbooks) |
-| Pre / post shell hooks |
-| **Non-disruptive DR test** (shadow namespaces) |
-| RTO measurement |
-| Audit log (JSONL) |
-| Split-brain detection |
-| Health-check pre-flight |
-| Reprotect guidance |
+- Protect VMs: per-PVC SnapMirror + metadata copy, replica VM created stopped
+- Replication status: per-volume SnapMirror state, health, **lag** and recovery point (from the ONTAP REST API)
+- Metadata sync (one-shot or `--watch`), so spec changes reach the replica
+- Planned failover with a final SnapMirror update → RPO 0, RTO measured per phase
+- Unplanned failover (`--unplanned`) with an RPO estimate per VM
+- Reprotect (reverse resync) and one-command failback
+- Recovery Plans (YAML runbooks), priority groups, startup delays, pre/post shell hooks
+- Split-brain detection, health-check (incl. replication lag threshold), JSONL audit log
+
+---
+
+## Requirements
+
+- Two Harvester / KubeVirt clusters, each with **Trident ≥ 22.10** (tested 26.06) on an ONTAP backend
+- The two ONTAP clusters **cluster-peered** and the SVMs **vserver-peered** (`-applications snapmirror`),
+  SnapMirror licensed on both; **unique SVM names** on the two sides
+- An ONTAP job schedule (e.g. the built-in `5min`, or a custom cron) on both ONTAP clusters
+- VM disks on Trident `ontap-san` (iSCSI / NVMe-TCP) or `ontap-nas` StorageClasses. VMs created from Harvester
+  images (FlexClones of the image volume) work: SnapMirror transfers them as full, independent copies
+- ONTAP credentials are **discovered**: for every PVC Harvey follows PV → TridentVolume → TridentBackendConfig
+  and uses its `managementLIF` + credentials Secret. An SVM-scoped `vsadmin` login is enough.
 
 ---
 
@@ -82,257 +102,155 @@ pip install .
 ## Configuration
 
 ```bash
-harvey config init
-# then edit ~/.config/harvey/config.yaml
+harvey config init        # writes ~/.config/harvey/config.yaml  (or $HARVEY_CONFIG_DIR/config.yaml)
 ```
 
 ```yaml
+# Needed only for clusters reached through the Rancher proxy
 rancher_url: "https://rancher.mydomain.com"
 api_token:   "token-abcde:1234567890abcdefghijklmnopqrstuvwxyz"
+
 clusters:
-  primary: "c-m-xxxxxxxx"   # Rancher cluster ID for primary site
-  dr:      "c-m-yyyyyyyy"   # Rancher cluster ID for DR site
+  primary:
+    rancher_cluster_id: c-m-xxxxxxxx      # via Rancher ...
+  dr:
+    kubeconfig: ~/.kube/dr.yaml           # ... or a kubeconfig (token or client cert); context: optional
+    # ontap: {host: 192.0.2.10, username: vsadmin, password_env: DR_ONTAP_PW}   # optional override
+
+defaults:                                  # so --source/--destination can be omitted
+  source: primary
+  destination: dr
+
+replication:
+  policy: MirrorAllSnapshots               # async SnapMirror policy (Trident supports async only)
+  schedule: 5min                           # ONTAP schedule name; sets the RPO for unplanned failovers
+  storage_class_map: {}                    # source SC -> DR SC when the names differ
+  max_lag_seconds: 900                     # health-check threshold
+  timeouts: {stop: 300, start: 600, tmr: 300, transfer: 1800, stall: 120}
 ```
 
-Show config (token masked):
-```bash
-harvey config show
-```
+The old format (`clusters: {primary: "c-m-xxxx"}`) still works.
 
 ---
 
 ## Commands
 
-### status — Compare VM state across sites
+### protect / unprotect
 
 ```bash
-harvey status primary dr
-harvey status primary dr --namespace production
+harvey protect  -n production db-1 app-1 [--wait]        # --wait: block until the baseline transfer is done
+harvey unprotect -n production db-1 [--delete-replica]
 ```
 
-Failover State column:
+`protect` (idempotent):
+1. creates a TMR `state: promoted` per PVC on the source to get each ONTAP volume handle;
+2. copies Secrets / ConfigMaps / NADs and creates the replica VM (stopped, `runStrategy: Halted`) on DR;
+3. creates a TMR `state: established` + a PVC annotated `trident.netapp.io/mirrorRelationship` per disk on DR.
 
-| State | Meaning |
-|---|---|
-| ✅ Ready | One site running, other stopped — safe to fail over |
-| ✅ Synced | Same state on both sides (both stopped) |
-| ❌ SPLIT BRAIN | Running on **both** clusters — requires immediate manual action |
-| Standalone | VM exists on only one cluster |
+The replica VM keeps the same name, namespace, MAC addresses and disk names. PVC templates and image references are
+dropped on the replica (its disks are the mirrored PVCs). NADs that already exist on DR are left alone (they may be
+site-specific); a missing cluster network is reported.
 
----
-
-### health-check — Pre-flight DR readiness
+### replication status
 
 ```bash
-harvey health-check primary dr
+harvey replication status [-n production]
 ```
 
-Checks:
-- API connectivity to both clusters
-- VM inventory coverage (VMs present on both sides)
-- Split-brain detection
-- Saved recovery plans
+Per volume: TMR state on each side, SnapMirror state, healthy, **lag** (time since the newest replicated
+snapshot = worst-case data loss for an unplanned failover), recovery point, notes. Shows `SPLIT BRAIN` if a VM
+runs on both sides and `needs reprotect` after a failover.
 
----
-
-### failover — Ad-hoc failover operations
-
-All failover commands share these flags:
-
-| Flag | Meaning |
-|---|---|
-| `--dry-run` | Print the ordered plan without touching any VMs |
-| `--yes / -y` | Skip confirmation prompt |
-| `--source` | Cluster where VMs are currently running |
-| `--destination` | Cluster to start VMs on |
+### sync
 
 ```bash
-# Specific VMs
-harvey failover vm db-primary app-server-1 \
-    --namespace production --source primary --destination dr
-
-# All VMs in a namespace
-harvey failover namespace production \
-    --source primary --destination dr
-
-# Everything
-harvey failover all --source primary --destination dr --dry-run
+harvey sync [-n production] [vm ...] [--watch 300]
 ```
 
-#### Ordering labels (set on VirtualMachine objects in Harvester)
+Copies VM metadata from each VM's current primary to its replica (direction detected per VM). The replica
+always stays stopped. Run it from cron / `--watch` to keep spec changes in step; failover also syncs first.
+
+### failover
+
+```bash
+harvey failover vm db-1 app-1 -n production [--dry-run] [--yes]
+harvey failover namespace production
+harvey failover all
+harvey failover vm db-1 -n production --unplanned [--force]   # source site down
+```
+
+Planned: metadata sync → stop on source (lowest priority first) → final SnapMirror update per volume (waits for
+the transfer, aborts + retries a stalled one) → promote → start on DR (highest priority first) → summary with RTO
+per phase and **RPO 0**.
+
+Unplanned: no stop, no final sync; promote + start. RPO = age of the newest replicated snapshot (reported).
+Refuses if the VM is still running on a reachable source (split-brain) unless `--force`.
+
+### reprotect / failback
+
+```bash
+harvey reprotect -n production db-1 [--wait]     # after a failover: replicate back (overwrites the old copy)
+harvey failback  -n production db-1              # planned failover back + reprotect
+```
+
+### Ordering labels (on the VirtualMachine)
 
 ```yaml
 metadata:
   labels:
-    failover-priority:    "100"   # higher = stopped first, started last
-    failover-startup-time: "60"   # seconds to pause after issuing 'start'
+    failover-priority:     "100"   # higher = stopped LAST, started FIRST
+    failover-startup-time: "60"    # seconds to pause after starting this VM
 ```
 
-Stop order: **descending** priority (100 → 50 → 0)  
-Start order: **ascending** priority (0 → 50 → 100) — foundations before dependents
-
----
-
-### plan — Recovery Plans (YAML runbooks)
-
-Recovery plans encode your full DR runbook — protection groups, VM ordering, startup delays, and shell hooks — so the same procedure runs identically every time.
-
-#### Create a plan
+### plan — Recovery Plans
 
 ```bash
-harvey plan new production-dr
-# edit ~/.config/harvey/plans/production-dr.yaml
-```
-
-Plan file structure (`~/.config/harvey/plans/<name>.yaml`):
-
-```yaml
-name: production-dr
-description: "Full production site failover"
-source:      primary
-destination: dr
-
-protection_groups:
-  - name: database-tier
-    priority: 100          # stopped first, started last
-    startup_delay: 60      # seconds to wait after 'start' before next group
-    vms:
-      - namespace: production
-        name: db-primary
-      - namespace: production
-        name: db-replica
-
-  - name: app-tier
-    priority: 50
-    startup_delay: 30
-    vms:
-      - namespace: production
-        name: app-server-1
-
-  - name: web-tier
-    priority: 10
-    startup_delay: 0
-    vms:
-      - namespace: production
-        name: web-proxy
-
-hooks:
-  pre_failover:
-    - name: "Page on-call"
-      command: "curl -sf -X POST -d 'DR starting' https://hooks.slack.com/..."
-      timeout: 30
-      on_failure: warn      # warn | abort
-
-  pre_start:
-    - name: "Drain load balancer"
-      command: "./scripts/lb-drain.sh --site primary"
-
-  post_failover:
-    - name: "Update DNS"
-      command: "./scripts/update-dns.sh --target dr"
-      timeout: 60
-```
-
-Hook environment variables available in your scripts:
-
-| Variable | Value |
-|---|---|
-| `HARVEY_SOURCE` | Source cluster name |
-| `HARVEY_DESTINATION` | Destination cluster name |
-
-#### List / inspect plans
-
-```bash
-harvey plan list
-harvey plan show production-dr
-```
-
-#### Run a plan — dry run
-
-```bash
+harvey plan new production-dr && harvey plan edit production-dr
 harvey plan run production-dr --dry-run
+harvey plan run production-dr                  # planned failover with hooks
+harvey plan run production-dr --unplanned      # site down
+harvey plan run production-dr --reverse        # run it destination → source (failback, after reprotect)
+harvey plan run production-dr --test           # shadow-namespace boot test (see limitations)
 ```
 
-#### Run a plan — non-disruptive DR test ⭐
+Plan files keep the same structure (protection groups with `priority`, `startup_delay`, `vms`, and
+`hooks.pre_failover|pre_start|post_failover` with `HARVEY_SOURCE` / `HARVEY_DESTINATION` in the environment).
+
+### health-check, status, audit
 
 ```bash
-harvey plan run production-dr --test
-```
-
-The test runs in three phases:
-
-1. **Clone** — copies VM specs into shadow namespaces (`*-harvey-test`) on the DR cluster
-2. **Verify** — starts each shadow VM and polls for Running state (5-minute timeout per VM)
-3. **Cleanup** — deletes all shadow namespaces regardless of test outcome
-
-Production VMs on both clusters are **never touched**.
-
-> **Storage note:** Shadow VMs retain their original PVC/DataVolume references.
-> If those volumes don't exist on the DR cluster the VM will time out — which is
-> exactly the kind of readiness gap this test is designed to surface before a
-> real DR event.
-
-#### Run a plan — live failover
-
-```bash
-harvey plan run production-dr
-harvey plan run production-dr --yes   # skip confirmation
+harvey health-check primary dr     # API reachability, split-brain, replication health + lag threshold, plans
+harvey status primary dr           # VM state side by side
+harvey audit --limit 100           # ~/.config/harvey/audit.log (JSONL), incl. RTO/RPO per failover
 ```
 
 ---
 
-### reprotect — Reverse protection after failover
+## Typical workflow
 
-After a successful failover the DR cluster is your new production site. `reprotect` shows what is running there and prints the exact command to fail back once the original site recovers.
-
-```bash
-harvey reprotect --source primary --destination dr
+```
+harvey protect -n prod db-1 app-1 --wait            # once
+harvey sync --watch 300 &                           # keep metadata in step
+harvey health-check primary dr                      # cron
+harvey failover vm db-1 app-1 -n prod               # planned: RPO 0
+harvey reprotect -n prod db-1 app-1                 # DR -> primary replication
+harvey failback  -n prod db-1 app-1                 # back home, replication primary -> DR again
 ```
 
 ---
 
-### audit — Operation history
+## Known limitations
 
-```bash
-harvey audit
-harvey audit --limit 100
-```
-
-All Harvey operations are appended to `~/.config/harvey/audit.log` (newline-delimited JSON).
-
----
-
-## Debug mode
-
-Add `--debug` before any command for verbose API request/response output:
-
-```bash
-harvey --debug status primary dr
-harvey --debug plan run production-dr --dry-run
-```
-
----
-
-## Typical DR workflow
-
-```
-1. Day-to-day verification
-   harvey health-check primary dr         # automated / cron
-
-2. Pre-event readiness test (non-disruptive)
-   harvey plan run production-dr --test   # runs weekly / monthly
-
-3. DR event declared
-   harvey status primary dr               # confirm split-brain / ready state
-   harvey plan run production-dr --dry-run
-   harvey plan run production-dr          # live failover with RTO tracking
-
-4. After DR site stabilises
-   harvey reprotect --source primary --destination dr
-
-5. Original site recovers — fail back
-   harvey failover all --source dr --destination primary
-```
+- **Async only.** Trident TMRs support asynchronous SnapMirror policies only. The ONTAP `Sync` policy works
+  between the clusters but cannot be managed through Trident.
+- **Per-volume consistency.** Each disk is its own SnapMirror relationship; after an *unplanned* failover the disks
+  of one VM can come from different points in time (seen: one disk 1 min older than the others). Planned failovers
+  are unaffected (VM stopped + final update). ONTAP consistency groups are not available through Trident.
+- **Trident promote quirk (26.06 / ONTAP 9.16.1).** A TMR can report `promoted` while the volume is still DP:
+  when a scheduled transfer is running (break fails with "snapmirror transfer already in progress") or when the
+  relationship is already quiesced. Harvey aborts a running transfer before promoting and then verifies the volume
+  type in ONTAP, breaking the relationship itself if needed.
+- **`--test` mode** boots copies of the VM spec in shadow namespaces but does not clone the replica volumes yet.
 
 ---
 
@@ -366,4 +284,5 @@ Apache License 2.0 — see [LICENSE](LICENSE) for details.
 
 | Version | Key additions |
 |---|---|
-| 0.1 | Basic stop/start failover, namespace/all commands, priority labels, startup delays, dry-run, recovery plans, DR test mode, hooks, RTO tracking, audit log, health-check, reprotect |
+| 0.2 | Storage-aware DR: NetApp SnapMirror via Trident TMRs, protect/unprotect, replication status with lag, metadata sync, planned (lossless) and unplanned failover, reprotect, failback; kubeconfig or Rancher access; ONTAP credential discovery |
+| 0.1 | Basic stop/start failover, namespace/all commands, priority labels, startup delays, dry-run, recovery plans, DR test mode, hooks, RTO tracking, audit log, health-check, reprotect guidance |

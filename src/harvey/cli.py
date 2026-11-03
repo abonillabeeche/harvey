@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Harvey v1.0 - DR Orchestration CLI for KubeVirt / SUSE Virtualization
+Harvey - DR Orchestration CLI for KubeVirt / SUSE Virtualization
 
-Competing with VMware SRM for automated VM disaster recovery across two sites.
+Storage-aware disaster recovery across two sites:
+  - NetApp ONTAP SnapMirror (driven through Trident TridentMirrorRelationships) replicates the VM disks
+  - Harvey replicates the metadata (VM spec, cloud-init/credential Secrets, ConfigMaps, NADs)
+  - Failover  : stop on source -> final SnapMirror update -> promote replica volumes -> start on DR
+  - Reprotect : reverse resync so the old primary becomes the replica; failback = failover + reprotect
 
-New in 1.0 vs 0.4:
-  - Recovery Plans  : YAML runbooks with protection groups, hooks, and ordering
-  - DR Test Mode    : Non-disruptive shadow-namespace clone test (mirrors SRM test recovery)
-  - Pre/Post Hooks  : Shell commands at key failover phases
-  - RTO Tracking    : Measures and reports actual recovery time
-  - Audit Log       : Structured JSONL record of all operations
-  - Health Check    : Pre-flight connectivity, coverage, and split-brain detection
-  - Reprotect       : Guided reverse-failover workflow after DR activation
-  - config show     : Displays masked config
+Also: recovery plans (priority groups, hooks), RTO/RPO tracking, JSONL audit log, health checks,
+split-brain detection.
 """
 
 import copy
@@ -25,7 +22,6 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import requests
 import typer
 import yaml
 from rich import box
@@ -36,18 +32,35 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from typing_extensions import Annotated
 
+from . import __version__
+from .kube import KubeClient, KubeError
+from .ontap import OntapError
+from .replication import (L_ROLE, A_REPROTECT, ReplicationError, Replicator, vm_status as _vm_printable)
+
 # ── Paths ────────────────────────────────────────────────────────────────────
-CONFIG_DIR  = Path.home() / ".config" / "harvey"
+CONFIG_DIR  = Path(os.environ.get("HARVEY_CONFIG_DIR", Path.home() / ".config" / "harvey"))
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 PLANS_DIR   = CONFIG_DIR / "plans"
 AUDIT_LOG   = CONFIG_DIR / "audit.log"
 
 CONFIG_TEMPLATE = {
+    # Only needed for clusters reached through the Rancher proxy (rancher_cluster_id).
     "rancher_url": "https://your-rancher-url.com",
     "api_token":   "token-xxxxx:xxxxxxxxxxxxxxxxxxxxxxxxxx",
     "clusters": {
-        "primary": "c-m-xxxxxxxx",
-        "dr":      "c-m-yyyyyyyy",
+        # Either a Rancher cluster ID ...
+        "primary": {"rancher_cluster_id": "c-m-xxxxxxxx"},
+        # ... or a kubeconfig (token or client-cert auth); context optional.
+        "dr":      {"kubeconfig": "~/.kube/dr.yaml"},
+        # ONTAP credentials are discovered from each cluster's Trident backend (managementLIF + Secret).
+        # Override per cluster with:  ontap: {host: 192.0.2.10, username: vsadmin, password: ...}
+    },
+    "defaults": {"source": "primary", "destination": "dr"},
+    "replication": {
+        "policy":   "MirrorAllSnapshots",   # an async SnapMirror policy (Trident supports async only)
+        "schedule": "5min",                 # an ONTAP job schedule on the destination cluster
+        "storage_class_map": {},            # source SC -> destination SC, when names differ
+        "max_lag_seconds": 900,             # health-check threshold
     },
 }
 
@@ -116,10 +129,12 @@ app          = typer.Typer(help="Harvey — DR orchestration CLI for KubeVirt/SU
 config_app   = typer.Typer(help="Manage CLI configuration.")
 failover_app = typer.Typer(help="Ad-hoc failover operations.")
 plan_app     = typer.Typer(help="Manage and execute recovery plans.")
+repl_app     = typer.Typer(help="Replication (SnapMirror) state of protected VMs.")
 
 app.add_typer(config_app,   name="config")
 app.add_typer(failover_app, name="failover")
 app.add_typer(plan_app,     name="plan")
+app.add_typer(repl_app,     name="replication")
 
 console = Console()
 
@@ -128,10 +143,16 @@ console = Console()
 def main_callback(
     debug: Annotated[bool, typer.Option("--debug", help="Verbose API output.")] = False,
 ):
-    """Harvey v1.0 — DR orchestration for KubeVirt/SUSE Virtualization."""
+    """Harvey — storage-aware DR orchestration for KubeVirt/SUSE Virtualization."""
     if debug:
         state["debug"] = True
         console.print("[bold yellow]>>> DEBUG MODE ENABLED <<<[/bold yellow]")
+
+
+@app.command("version")
+def version():
+    """Prints the Harvey version."""
+    console.print(f"harvey {__version__}")
 
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
@@ -146,93 +167,68 @@ def _audit(event: str, details: dict):
 
 
 # ── API client ────────────────────────────────────────────────────────────────
-class HarvesterClient:
-    """Communicates with KubeVirt clusters via the Rancher API proxy."""
+class HarvesterClient(KubeClient):
+    """KubeClient plus the forgiving helpers the inventory/plan commands use (print + return None on error)."""
 
-    def __init__(self, rancher_url: str, token: str, cluster_id: str, cluster_name: str):
-        self.cluster_proxy_url = f"{rancher_url}/k8s/clusters/{cluster_id}"
-        self.cluster_name      = cluster_name
-        self.session           = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept":        "application/json",
-            "Content-Type":  "application/json",
-        })
-        self.session.verify = False
-        requests.packages.urllib3.disable_warnings()
+    @property
+    def cluster_name(self) -> str:
+        return self.name
 
-    def _request(self, method: str, path_segment: str, ok_codes: tuple = (), **kwargs):
-        """Generic request handler. ok_codes lets callers treat extra HTTP codes as success."""
-        url = f"{self.cluster_proxy_url}/{path_segment}"
-        if state["debug"]:
-            console.print(f"\n[cyan]DEBUG: {method} {url}[/cyan]")
+    def _safe(self, fn, *a, **kw):
         try:
-            resp = self.session.request(method, url, **kwargs)
-            if resp.status_code in ok_codes:
-                return {"status": "ok", "http_status": resp.status_code}
-            resp.raise_for_status()
-            if not resp.text:
-                return {"status": "success"}
-            data = resp.json()
-            if state["debug"]:
-                console.print(f"[cyan]DEBUG response:[/cyan]\n{json.dumps(data, indent=2)}")
-            return data
-        except requests.exceptions.HTTPError as e:
-            console.print(
-                f"[bold red]HTTP {e.response.status_code} from '{self.cluster_name}': "
-                f"{e.response.reason}[/bold red]"
-            )
-            if e.response.text:
-                console.print(f"[red]{e.response.text[:400]}[/red]")
-            return None
-        except requests.exceptions.RequestException as e:
-            console.print(f"[bold red]Network error → {self.cluster_proxy_url}: {e}[/bold red]")
-            return None
-        except json.JSONDecodeError:
-            console.print("[bold red]Failed to decode JSON response.[/bold red]")
+            return fn(*a, **kw)
+        except KubeError as e:
+            console.print(f"[bold red]{e}[/bold red]")
             return None
 
-    # ── VM operations ─────────────────────────────────────────────────────────
     def get_vms(self, namespace: str = None):
-        if namespace:
-            return self._request("GET", f"apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines")
-        return self._request("GET", "apis/kubevirt.io/v1/virtualmachines")
+        r = self._safe(self.list, "vm", namespace)
+        return None if r is None else {"items": r}
 
     def get_vm(self, namespace: str, vm_name: str):
-        return self._request("GET", f"apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}")
+        return self._safe(self.get, "vm", namespace, vm_name)
 
     def create_vm(self, namespace: str, vm_body: dict):
-        return self._request(
-            "POST", f"apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines",
-            ok_codes=(409,), json=vm_body,
-        )
+        try:
+            return self.create("vm", namespace, vm_body)
+        except KubeError as e:
+            if e.status == 409:
+                return {"status": "ok", "http_status": 409}
+            console.print(f"[bold red]{e}[/bold red]")
+            return None
 
     def delete_vm(self, namespace: str, vm_name: str):
-        return self._request("DELETE", f"apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}")
+        return self._safe(self.delete, "vm", namespace, vm_name)
 
     def _vm_action(self, namespace: str, vm_name: str, action: str):
-        console.print(
-            f"  Sending '[bold]{action}[/bold]' → "
-            f"[magenta]{namespace}/{vm_name}[/magenta] on [cyan]{self.cluster_name}[/cyan]..."
-        )
-        path = f"v1/harvester/kubevirt.io.virtualmachines/{namespace}/{vm_name}?action={action}"
-        return self._request("POST", path)
+        """start/stop through spec.runStrategy (works without the Harvester API, e.g. with a plain kubeconfig)."""
+        console.print(f"  Sending '[bold]{action}[/bold]' → [magenta]{namespace}/{vm_name}[/magenta] "
+                      f"on [cyan]{self.name}[/cyan]...")
+        vm = self.get_vm(namespace, vm_name)
+        if vm is None:
+            return None
+        if action == "stop":
+            patch = {"spec": {"runStrategy": "Halted"}}
+        else:
+            from .replication import original_run_strategy
+            patch = {"spec": {"runStrategy": original_run_strategy(vm)}}
+        if "running" in vm["spec"] and "runStrategy" not in vm["spec"]:
+            patch = {"spec": {"running": action != "stop"}}
+        return self._safe(self.merge_patch, "vm", namespace, vm_name, patch)
 
-    # ── Namespace operations ──────────────────────────────────────────────────
     def get_namespace(self, name: str):
-        return self._request("GET", f"api/v1/namespaces/{name}")
+        return self._safe(self.get, "namespace", None, name)
 
     def ensure_namespace(self, name: str) -> bool:
-        """Creates namespace if absent; returns True when namespace is ready."""
-        existing = self.get_namespace(name)
-        if existing is not None:
+        try:
+            KubeClient.ensure_namespace(self, name)
             return True
-        body = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}}
-        result = self._request("POST", "api/v1/namespaces", ok_codes=(409,), json=body)
-        return result is not None
+        except KubeError as e:
+            console.print(f"[bold red]{e}[/bold red]")
+            return False
 
     def delete_namespace(self, name: str):
-        return self._request("DELETE", f"api/v1/namespaces/{name}")
+        return self._safe(self.delete, "namespace", None, name)
 
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -245,15 +241,49 @@ def load_config() -> dict:
         return yaml.safe_load(fh)
 
 
+def make_client(config: dict, name: str) -> HarvesterClient:
+    clusters = config.get("clusters", {})
+    if name not in clusters:
+        console.print(f"[bold red]Cluster '{name}' not found in config.[/bold red] Available: {list(clusters)}")
+        sys.exit(1)
+    c = clusters[name]
+    if isinstance(c, str):  # legacy: bare Rancher cluster ID
+        c = {"rancher_cluster_id": c}
+    if c.get("kubeconfig"):
+        return HarvesterClient.from_kubeconfig(name, c["kubeconfig"], c.get("context"), debug=state["debug"])
+    if c.get("rancher_cluster_id"):
+        return HarvesterClient.from_rancher(name, config["rancher_url"], config["api_token"],
+                                            c["rancher_cluster_id"], debug=state["debug"])
+    console.print(f"[bold red]Cluster '{name}': set 'kubeconfig' or 'rancher_cluster_id'.[/bold red]")
+    sys.exit(1)
+
+
 def get_clients(config: dict, source: str, destination: str) -> Tuple[HarvesterClient, HarvesterClient]:
-    for name in (source, destination):
-        if name not in config.get("clusters", {}):
-            console.print(f"[bold red]Cluster '{name}' not found in config.[/bold red]")
-            console.print(f"Available: {list(config['clusters'].keys())}")
-            sys.exit(1)
-    cs = HarvesterClient(config["rancher_url"], config["api_token"], config["clusters"][source],      source)
-    cd = HarvesterClient(config["rancher_url"], config["api_token"], config["clusters"][destination], destination)
-    return cs, cd
+    return make_client(config, source), make_client(config, destination)
+
+
+def resolve_pair(config: dict, source: Optional[str], destination: Optional[str]) -> Tuple[str, str]:
+    d = config.get("defaults") or {}
+    s, t = source or d.get("source"), destination or d.get("destination")
+    if not s or not t:
+        console.print("[bold red]Give --source/--destination or set defaults.source/destination in the config."
+                      "[/bold red]")
+        sys.exit(1)
+    return s, t
+
+
+def make_replicator(config: dict, names: List[str]) -> Replicator:
+    clients = {n: make_client(config, n) for n in names}
+    overrides = {}
+    for n in names:
+        c = config["clusters"].get(n)
+        if isinstance(c, dict) and c.get("ontap"):
+            o = dict(c["ontap"])
+            if o.get("password_env"):
+                o["password"] = os.environ.get(o["password_env"], "")
+            overrides[n] = o
+    return Replicator(clients, config.get("replication") or {}, log=console.print,
+                      ontap_overrides=overrides, debug=state["debug"])
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -292,11 +322,11 @@ def _display_plan_table(plan: list, source: str, destination: str, title: str = 
     if not dry_run:
         console.rule("[bold blue]Stop Phase[/bold blue]")
         for ns, vm, prio, _ in by_stop:
-            console.print(f"  [yellow]Would stop[/yellow]  {ns}/{vm}  (priority {prio})")
+            console.print(f"  [yellow]Stop[/yellow]  {ns}/{vm}  (priority {prio})")
         console.rule("[bold blue]Start Phase[/bold blue]")
         for ns, vm, prio, delay in by_start:
             suffix = f", then wait {delay}s" if delay else ""
-            console.print(f"  [green]Would start[/green] {ns}/{vm}  (priority {prio}){suffix}")
+            console.print(f"  [green]Start[/green] {ns}/{vm}  (priority {prio}){suffix}")
         console.rule()
 
 
@@ -382,35 +412,35 @@ def _fetch_vm_maps(client_source: HarvesterClient, client_dest: HarvesterClient)
     if not src_data or not dst_data:
         console.print("[red]Failed to retrieve VM data from one or both clusters.[/red]")
         return None, None
-    vms_src = {
-        (v["metadata"]["namespace"], v["metadata"]["name"]): v
-        for v in src_data.get("items", [])
-    }
-    vms_dst_keys = {
-        (v["metadata"]["namespace"], v["metadata"]["name"])
-        for v in dst_data.get("items", [])
-    }
-    return vms_src, vms_dst_keys
+    vms_src = {(v["metadata"]["namespace"], v["metadata"]["name"]): v for v in src_data.get("items", [])}
+    vms_dst = {(v["metadata"]["namespace"], v["metadata"]["name"]): v for v in dst_data.get("items", [])}
+    return vms_src, vms_dst
 
 
 def _build_plan_from_inventory(
-    vms_src: dict, vms_dst_keys: set,
+    vms_src: dict, vms_dst: dict,
     namespace_filter: str = None,
     vm_names_filter: List[str] = None,
 ) -> list:
-    """Returns [(namespace, vm_name, priority, startup_delay), ...] for running VMs on both clusters."""
-    if namespace_filter:
-        vms_src      = {k: v for k, v in vms_src.items() if k[0] == namespace_filter}
-        vms_dst_keys = {k for k in vms_dst_keys if k[0] == namespace_filter}
-    if vm_names_filter:
-        vms_src      = {k: v for k, v in vms_src.items() if k[1] in vm_names_filter}
-
+    """[(namespace, vm_name, priority, startup_delay)] for VMs that are PRIMARY on the source and have a Harvey
+    replica on the destination. Unprotected VMs are listed as skipped."""
     plan = []
-    for key in vms_src.keys() & vms_dst_keys:
-        vm     = vms_src[key]
-        status = vm.get("status", {}).get("printableStatus", "Unknown")
-        if status != "Running":
+    for key, vm in sorted(vms_src.items()):
+        if namespace_filter and key[0] != namespace_filter:
             continue
+        if vm_names_filter and key[1] not in vm_names_filter:
+            continue
+        role_src = (vm["metadata"].get("labels") or {}).get(L_ROLE)
+        dvm = vms_dst.get(key)
+        role_dst = ((dvm or {}).get("metadata", {}).get("labels") or {}).get(L_ROLE)
+        if role_src != "primary" or role_dst != "replica":
+            if vm_names_filter:
+                console.print(f"[yellow]Skipping {key[0]}/{key[1]}: not protected in this direction "
+                              f"(source role={role_src}, destination role={role_dst}). "
+                              f"Run 'harvey protect' first.[/yellow]")
+            continue
+        if _vm_printable(vm) != "Running" and not vm_names_filter:
+            continue  # namespace/all failovers move running workloads only
         priority, startup_delay = _extract_labels(vm)
         plan.append((*key, priority, startup_delay))
     return plan
@@ -419,99 +449,71 @@ def _build_plan_from_inventory(
 # ── Core failover engine ──────────────────────────────────────────────────────
 def _execute_failover_plan(
     plan: list,
-    client_source: HarvesterClient,
-    client_dest:   HarvesterClient,
-    hooks:   dict = None,
-    dry_run: bool = False,
+    config: dict,
+    source: str,
+    destination: str,
+    hooks:     dict = None,
+    dry_run:   bool = False,
+    unplanned: bool = False,
+    force:     bool = False,
 ) -> dict:
     """
-    Stops VMs on source (lowest priority first: web→app→db), then starts them on
-    destination (highest priority first: db→app→web).  Returns a result dict with
-    outcome details and RTO.
+    Storage-aware failover. Planned: metadata sync -> stop on source (lowest priority first) ->
+    final SnapMirror update per volume -> promote replica volumes -> start on destination
+    (highest priority first). Unplanned: promote + start only, data loss up to the replication lag.
     """
-    hooks  = hooks or {}
-    ctx    = {"source": client_source.cluster_name, "destination": client_dest.cluster_name}
-    result = {"stopped": [], "started": [], "failed_stop": [], "failed_start": [], "rto_seconds": None}
+    hooks = hooks or {}
+    ctx = {"source": source, "destination": destination}
+    empty = {"stopped": [], "started": [], "failed": [], "rto_seconds": None, "rpo": {}, "phases": {}, "synced": []}
 
     if dry_run:
         console.print("\n[bold yellow]DRY RUN — no changes will be made.[/bold yellow]")
-        console.rule("[bold blue]Stop Phase (Dry Run)[/bold blue]")
+        steps = (["metadata sync", "stop (lowest priority first)", "final SnapMirror update"]
+                 if not unplanned else []) + ["promote replica volumes", "start (highest priority first)"]
+        console.print("  Phases: " + " → ".join(steps))
         for ns, vm, prio, _ in sorted(plan, key=lambda x: x[2]):
-            console.print(f"  [yellow]Would stop[/yellow]  {ns}/{vm}  (priority {prio})")
-        console.rule("[bold blue]Start Phase (Dry Run)[/bold blue]")
-        for ns, vm, prio, delay in sorted(plan, key=lambda x: x[2], reverse=True):
-            suffix = f", then wait {delay}s" if delay else ""
-            console.print(f"  [yellow]Would start[/yellow] {ns}/{vm}  (priority {prio}){suffix}")
+            console.print(f"  [yellow]Would fail over[/yellow] {ns}/{vm}  (priority {prio})")
         console.rule("[bold green]Dry run complete[/bold green]")
-        return result
+        return empty
 
-    rto_start = time.time()
+    rep = make_replicator(config, [source, destination])
 
-    # ── pre_failover hooks ────────────────────────────────────────────────────
-    if not _run_hooks(hooks.get("pre_failover", []), "pre_failover", ctx):
-        console.print("[bold red]Pre-failover hook aborted the operation.[/bold red]")
-        return result
+    def hook_cb(phase: str) -> bool:
+        return _run_hooks(hooks.get(phase, []), phase, ctx)
 
-    # ── Stop phase ────────────────────────────────────────────────────────────
-    console.rule("[bold blue]Stop Phase[/bold blue]")
-    for ns, vm, prio, delay in sorted(plan, key=lambda x: x[2]):
-        console.print(f"\n[bold]Stopping {ns}/{vm}[/bold]  (priority {prio})")
-        client_source._vm_action(ns, vm, "stop")
-        if _poll_until(client_source, ns, vm, ("Stopped", "Halted"), "stopping", timeout_s=120):
-            console.print(f"  [green]✓ Confirmed stopped.[/green]")
-            result["stopped"].append((ns, vm, prio, delay))
-            _audit("vm_stopped", {"namespace": ns, "vm": vm, "cluster": client_source.cluster_name})
-        else:
-            console.print(f"  [red]✗ Timed out waiting for {ns}/{vm} to stop. Skipping start.[/red]")
-            result["failed_stop"].append((ns, vm))
-            _audit("vm_stop_timeout", {"namespace": ns, "vm": vm, "cluster": client_source.cluster_name})
-
-    if not result["stopped"]:
-        console.print("\n[bold yellow]No VMs stopped successfully — aborting start phase.[/bold yellow]")
-        return result
-
-    # ── pre_start hooks ───────────────────────────────────────────────────────
-    _run_hooks(hooks.get("pre_start", []), "pre_start", ctx)
-
-    # ── Start phase ───────────────────────────────────────────────────────────
-    console.rule("[bold blue]Start Phase[/bold blue]")
-    for ns, vm, prio, delay in sorted(result["stopped"], key=lambda x: x[2], reverse=True):
-        console.print(f"\n[bold]Starting {ns}/{vm}[/bold]  (priority {prio})")
-        client_dest._vm_action(ns, vm, "start")
-        console.print(f"  [green]✓ Start command sent.[/green]")
-        result["started"].append((ns, vm))
-        _audit("vm_started", {"namespace": ns, "vm": vm, "cluster": client_dest.cluster_name})
-        if delay > 0:
-            console.print(f"  Pausing [cyan]{delay}s[/cyan] for service initialization...")
-            time.sleep(delay)
-
-    # ── post_failover hooks ───────────────────────────────────────────────────
-    _run_hooks(hooks.get("post_failover", []), "post_failover", ctx)
-
-    result["rto_seconds"] = int(time.time() - rto_start)
-    return result
+    try:
+        r = rep.failover(plan, source, destination, unplanned=unplanned, force=force, hooks_cb=hook_cb)
+    except (ReplicationError, KubeError, OntapError) as e:
+        console.print(f"\n[bold red]Failover aborted: {e}[/bold red]")
+        _audit("failover_aborted", {"source": source, "destination": destination, "error": str(e)})
+        return {**empty, "failed": [("-", "preflight", str(e))]}
+    return {"stopped": r.stopped, "started": r.started, "failed": r.failed, "rto_seconds": r.rto_seconds,
+            "rpo": r.rpo, "phases": r.phases, "synced": r.synced, "promoted": r.promoted}
 
 
 def _print_failover_summary(result: dict):
     rto = result.get("rto_seconds")
-    console.rule("[bold green]Failover Complete[/bold green]")
+    console.rule("[bold green]Failover Complete[/bold green]" if not result["failed"]
+                 else "[bold yellow]Failover finished with errors[/bold yellow]")
     t = Table(title="Failover Summary", box=box.ROUNDED)
     t.add_column("Metric", style="bold")
-    t.add_column("Value",  justify="right")
-    t.add_row("[green]VMs started on DR[/green]",     str(len(result["started"])))
-    t.add_row("[blue]VMs stopped on source[/blue]",   str(len(result["stopped"])))
-    if result["failed_stop"]:
-        t.add_row("[red]Stop failures[/red]",         str(len(result["failed_stop"])))
-    if result["failed_start"]:
-        t.add_row("[red]Start failures[/red]",        str(len(result["failed_start"])))
+    t.add_column("Value", justify="right")
+    t.add_row("[blue]VMs stopped on source[/blue]", str(len(result["stopped"])))
+    t.add_row("[magenta]Volumes final-synced[/magenta]", str(len(result.get("synced", []))))
+    t.add_row("[green]VMs started on DR[/green]", str(len(result["started"])))
+    if result["failed"]:
+        t.add_row("[red]Failures[/red]", str(len(result["failed"])))
+    for phase, secs in (result.get("phases") or {}).items():
+        t.add_row(f"[dim]  {phase}[/dim]", f"{secs}s")
     if rto is not None:
-        t.add_row("[cyan]Total RTO[/cyan]",           f"{rto}s  ({rto // 60}m {rto % 60}s)")
+        t.add_row("[cyan]Total RTO[/cyan]", f"{rto}s  ({rto // 60}m {rto % 60}s)")
+    for vm, rpo in (result.get("rpo") or {}).items():
+        t.add_row(f"[cyan]RPO {vm}[/cyan]",
+                  "0s (lossless)" if rpo == 0 else ("unknown" if rpo is None else f"≤ {rpo}s"))
     console.print(t)
+    for vm, phase, err in result["failed"]:
+        console.print(f"  [red]• {vm} [{phase}]: {err}[/red]")
 
-    if result["failed_stop"]:
-        console.print("\n[red]VMs that failed to stop:[/red]")
-        for ns, vm in result["failed_stop"]:
-            console.print(f"  [red]• {ns}/{vm}[/red]")
 
 
 def _save_plan_from_dry_run(plan: list, source: str, destination: str):
@@ -564,30 +566,38 @@ def _save_plan_from_dry_run(plan: list, source: str, destination: str):
 
 
 def _ad_hoc_failover(
-    client_source: HarvesterClient, client_dest: HarvesterClient,
-    plan: list, source: str, destination: str, yes: bool, dry_run: bool,
+    config: dict, plan: list, source: str, destination: str, yes: bool, dry_run: bool,
+    unplanned: bool = False, force: bool = False, hint: bool = True,
 ):
     if not plan:
-        console.print("[green]No eligible running VMs found on source that also exist on destination.[/green]")
+        console.print("[green]No protected VMs to fail over (primary on source, replica on destination).[/green]")
         return
     _display_plan_table(plan, source, destination, dry_run=dry_run)
+    if unplanned:
+        console.print("[bold red]UNPLANNED failover: no final sync — data written after the last SnapMirror "
+                      "transfer is lost.[/bold red]")
     if not yes and not dry_run:
         if not Confirm.ask("\nProceed with this failover?"):
             console.print("Aborted.")
             return
-    _audit("failover_started", {"source": source, "destination": destination,
-                                "vm_count": len(plan), "dry_run": dry_run})
-    result = _execute_failover_plan(plan, client_source, client_dest, dry_run=dry_run)
+    _audit("failover_started", {"source": source, "destination": destination, "vm_count": len(plan),
+                                "dry_run": dry_run, "unplanned": unplanned})
+    result = _execute_failover_plan(plan, config, source, destination, dry_run=dry_run,
+                                    unplanned=unplanned, force=force)
     if dry_run:
         _save_plan_from_dry_run(plan, source, destination)
         return
     _print_failover_summary(result)
     _audit("failover_completed", {
-            "source": source, "destination": destination,
-            "started": len(result["started"]),
-            "failed":  len(result["failed_stop"]) + len(result["failed_start"]),
-            "rto_seconds": result.get("rto_seconds"),
-        })
+        "source": source, "destination": destination, "unplanned": unplanned,
+        "started": len(result["started"]), "failed": len(result["failed"]),
+        "rto_seconds": result.get("rto_seconds"), "rpo": result.get("rpo"), "phases": result.get("phases"),
+    })
+    if result["started"] and hint:
+        console.print(f"\nNext: once {source} is healthy, run "
+                      f"[bold cyan]harvey reprotect -n <ns> <vm>[/bold cyan] to replicate back "
+                      f"({destination} → {source}).")
+
 
 
 # ── Shadow VM spec builder ────────────────────────────────────────────────────
@@ -840,6 +850,9 @@ def config_show():
     token = cfg.get("api_token", "")
     if len(token) > 12:
         cfg["api_token"] = token[:8] + "***" + token[-4:]
+    for c in (cfg.get("clusters") or {}).values():
+        if isinstance(c, dict) and (c.get("ontap") or {}).get("password"):
+            c["ontap"]["password"] = "***"
     console.print(yaml.dump(cfg, default_flow_style=False))
 
 
@@ -980,7 +993,37 @@ def health_check(
     else:
         console.print(f"  [green]✓ No split-brain conditions detected.[/green]")
 
-    # 3. Plans coverage
+    # 3. Replication (protected VMs)
+    rep = make_replicator(config, [cluster1, cluster2])
+    max_lag = int((config.get("replication") or {}).get("max_lag_seconds", 900))
+    protected = rep.protected_vms()
+    console.print(f"\n  Protected VMs (SnapMirror): [bold]{len(protected)}[/bold]  (max lag {max_lag}s)")
+    for ns, name in protected:
+        p, r = rep.direction(ns, name, cluster1, cluster2)
+        if not p:
+            console.print(f"    [red]✗ {ns}/{name}: no single primary[/red]")
+            all_ok = False
+            continue
+        try:
+            rows = rep.volume_status(ns, name, p, r)
+        except (ReplicationError, KubeError, OntapError) as e:
+            console.print(f"    [red]✗ {ns}/{name}: {e}[/red]")
+            all_ok = False
+            continue
+        bad = [v for v in rows if v.sm_state != "snapmirrored" or (v.lag_s or 0) > max_lag]
+        rv = rep.k[r].get("vm", ns, name)
+        if ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT):
+            console.print(f"    [yellow]⚠ {ns}/{name}: running on {p} without protection — run harvey reprotect[/yellow]")
+            all_ok = False
+        elif bad:
+            for v in bad:
+                console.print(f"    [red]✗ {ns}/{name} {v.claim}: {v.sm_state}, lag {_fmt_lag(v.lag_s)} {v.note}[/red]")
+            all_ok = False
+        else:
+            worst = max((v.lag_s or 0) for v in rows) if rows else 0
+            console.print(f"    [green]✓[/green] {ns}/{name} {p} → {r}: {len(rows)} volume(s), worst lag {_fmt_lag(worst)}")
+
+    # 4. Plans coverage
     PLANS_DIR.mkdir(parents=True, exist_ok=True)
     plans = list(PLANS_DIR.glob("*.yaml"))
     if plans:
@@ -1032,134 +1075,315 @@ def show_audit(
     console.print(t)
 
 
+# ── protection ────────────────────────────────────────────────────────────────
+SourceOpt = Annotated[Optional[str], typer.Option("--source", "-s", help="Source cluster (default: config defaults).")]
+DestOpt = Annotated[Optional[str], typer.Option("--destination", "-d", help="Destination cluster (default: config defaults).")]
+NsOpt = Annotated[str, typer.Option("--namespace", "-n", help="Namespace of the VMs.")]
+
+
+def _pair_for_vm(rep: Replicator, ns: str, vm: str, a: str, b: str) -> Tuple[str, str]:
+    p, r = rep.direction(ns, vm, a, b)
+    if not p:
+        console.print(f"[bold red]{ns}/{vm}: no single primary found between {a} and {b} "
+                      f"(not protected, or both claim primary).[/bold red]")
+        raise typer.Exit(1)
+    return p, r
+
+
+@app.command("protect")
+def protect(
+    vm_names: Annotated[List[str], typer.Argument(help="VM name(s) to protect.")],
+    namespace: NsOpt,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    wait: Annotated[bool, typer.Option("--wait", help="Wait for the SnapMirror baseline transfer.")] = False,
+):
+    """
+    Protects VMs: replicates every PVC with SnapMirror (Trident TMRs) and copies the VM spec, Secrets,
+    ConfigMaps and NADs to the destination, where the replica VM is created stopped.
+    """
+    config = load_config()
+    source, destination = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [source, destination])
+    rc = 0
+    for vm in vm_names:
+        console.rule(f"[bold]protect {namespace}/{vm}: {source} → {destination}[/bold]")
+        try:
+            for line in rep.protect(namespace, vm, source, destination, wait_init=wait):
+                console.print(f"  {line}")
+            _audit("vm_protected", {"namespace": namespace, "vm": vm, "source": source, "destination": destination})
+            console.print(f"  [green]✓ {namespace}/{vm} protected[/green]")
+        except (ReplicationError, KubeError, OntapError) as e:
+            rc = 1
+            console.print(f"  [bold red]✗ {e}[/bold red]")
+    if rc:
+        raise typer.Exit(rc)
+
+
+@app.command("unprotect")
+def unprotect(
+    vm_names: Annotated[List[str], typer.Argument(help="VM name(s).")],
+    namespace: NsOpt,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    delete_replica: Annotated[bool, typer.Option("--delete-replica", help="Also delete the replica VM, its PVCs "
+                                                 "and copied Secrets on the replica side.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+):
+    """Stops replication for VMs (deletes the TMRs; the replica volumes become independent read-write copies)."""
+    config = load_config()
+    a, b = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [a, b])
+    for vm in vm_names:
+        p, r = _pair_for_vm(rep, namespace, vm, a, b)
+        what = "and DELETE the replica VM + volumes " if delete_replica else ""
+        if not yes and not Confirm.ask(f"Stop replicating {namespace}/{vm} ({p} → {r}) {what}?"):
+            continue
+        try:
+            for line in rep.unprotect(namespace, vm, p, r, delete_replica):
+                console.print(f"  {line}")
+            _audit("vm_unprotected", {"namespace": namespace, "vm": vm, "primary": p, "replica": r,
+                                      "deleted_replica": delete_replica})
+        except (ReplicationError, KubeError) as e:
+            console.print(f"  [bold red]✗ {e}[/bold red]")
+            raise typer.Exit(1)
+
+
+@app.command("sync")
+def sync(
+    vm_names: Annotated[Optional[List[str]], typer.Argument(help="VM name(s); default: all protected VMs.")] = None,
+    namespace: Annotated[Optional[str], typer.Option("--namespace", "-n")] = None,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    watch: Annotated[int, typer.Option("--watch", help="Repeat every N seconds (0 = once).")] = 0,
+):
+    """
+    Re-copies VM metadata (spec, Secrets, ConfigMaps, NADs) from each VM's primary to its replica.
+    Disks are replicated by SnapMirror on its own schedule; this keeps the small stuff in step.
+    """
+    config = load_config()
+    a, b = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [a, b])
+    while True:
+        targets = [(ns, v) for ns, v in rep.protected_vms(namespace) if not vm_names or v in vm_names]
+        for ns, vm in targets:
+            p, r = rep.direction(ns, vm, a, b)
+            if not p:
+                console.print(f"[yellow]{ns}/{vm}: direction unclear, skipped[/yellow]")
+                continue
+            try:
+                acts = rep.sync_metadata(ns, vm, p, r)
+                warn = [x for x in acts if x.startswith("WARN")]
+                console.print(f"[green]✓[/green] {ns}/{vm} {p} → {r}: {len(acts) - len(warn)} object(s)"
+                              + (f", [yellow]{len(warn)} warning(s)[/yellow]" if warn else ""))
+                for w in warn:
+                    console.print(f"    [yellow]{w}[/yellow]")
+            except (ReplicationError, KubeError) as e:
+                console.print(f"[red]✗ {ns}/{vm}: {e}[/red]")
+        if not watch:
+            break
+        time.sleep(watch)
+
+
+def _fmt_lag(s: Optional[int]) -> str:
+    if s is None:
+        return "-"
+    return f"{s}s" if s < 120 else f"{s // 60}m{s % 60:02d}s"
+
+
+@repl_app.command("status")
+def replication_status(
+    namespace: Annotated[Optional[str], typer.Option("--namespace", "-n")] = None,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+):
+    """Per-volume replication state of protected VMs: TMR states, SnapMirror state, health, lag, recovery point."""
+    config = load_config()
+    a, b = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [a, b])
+    vms = rep.protected_vms(namespace)
+    if not vms:
+        console.print("[dim]No protected VMs.[/dim]")
+        return
+    t = Table(title="Replication status", box=box.ROUNDED)
+    t.add_column("VM / direction / state", no_wrap=True)
+    t.add_column("Volume", no_wrap=True)
+    for col in ("TMR pri→rep", "SnapMirror", "Healthy", "Lag", "Recovery point"):
+        t.add_column(col, overflow="fold")
+    t.add_column("Note", overflow="fold", max_width=40)
+    short = {"promoted": "prom", "established": "est", "reestablished": "re-est", "-": "-"}
+    worst = 0
+    for ns, vm in vms:
+        p, r = rep.direction(ns, vm, a, b)
+        if not p:
+            t.add_row(f"{ns}/{vm}\n[red]direction unclear[/red]", "", "", "", "", "", "", "")
+            continue
+        pv = rep.k[p].get("vm", ns, vm)
+        rv = rep.k[r].get("vm", ns, vm)
+        vstate = f"{_vm_printable(pv)} / {_vm_printable(rv)}"
+        if _vm_printable(pv) == "Running" and _vm_printable(rv) == "Running":
+            vstate = "[bold white on red]SPLIT BRAIN[/bold white on red]"
+        reprot = ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT)
+        rows = rep.volume_status(ns, vm, p, r)
+        for i, vs in enumerate(rows):
+            worst = max(worst, vs.lag_s or 0)
+            healthy = "-" if vs.healthy is None else ("[green]yes[/green]" if vs.healthy else "[red]no[/red]")
+            note = vs.note or ("needs reprotect" if reprot else "")
+            first = {0: f"[bold]{ns}/{vm}[/bold]", 1: f"{p} → {r}", 2: vstate}.get(i, "")
+            t.add_row(first, vs.claim, f"{short.get(vs.src_tmr, vs.src_tmr)}→{short.get(vs.dst_tmr, vs.dst_tmr)}",
+                      vs.sm_state, healthy, _fmt_lag(vs.lag_s),
+                      vs.recovery_point.strftime("%H:%M:%S") if vs.recovery_point else "-", note)
+        for extra in ([f"{p} → {r}", vstate][len(rows) - 1:] if len(rows) < 3 else []):
+            t.add_row(extra, "", "", "", "", "", "", "")
+    console.print(t)
+    console.print(f"Worst lag: [bold]{_fmt_lag(worst)}[/bold]  (schedule "
+                  f"'{(config.get('replication') or {}).get('schedule', '5min')}'; lag = age of the newest "
+                  f"replicated snapshot = worst-case data loss if the primary site fails now)")
+
+
+@app.command("reprotect")
+def reprotect(
+    vm_names: Annotated[List[str], typer.Argument(help="VM name(s).")],
+    namespace: NsOpt,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    wait: Annotated[bool, typer.Option("--wait", help="Wait until the reverse resync has transferred.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+):
+    """
+    After a failover: replicate back from the new primary to the old one (reverse resync).
+    The old primary's copy of the disks is OVERWRITTEN with the new primary's data.
+    """
+    config = load_config()
+    a, b = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [a, b])
+    for vm in vm_names:
+        p, r = _pair_for_vm(rep, namespace, vm, a, b)
+        if not yes and not Confirm.ask(f"Reverse-resync {namespace}/{vm}: {p} → {r} (overwrites {r}'s disks)?"):
+            continue
+        try:
+            for line in rep.reprotect(namespace, vm, p, r, wait_init=wait):
+                console.print(f"  {line}")
+            _audit("vm_reprotected", {"namespace": namespace, "vm": vm, "primary": p, "replica": r})
+            console.print(f"  [green]✓ {namespace}/{vm} replicating {p} → {r}[/green]")
+        except (ReplicationError, KubeError, OntapError) as e:
+            console.print(f"  [bold red]✗ {e}[/bold red]")
+            raise typer.Exit(1)
+
+
 # ── failback ──────────────────────────────────────────────────────────────────
 @app.command("failback")
 def failback(
-    source:      Annotated[str, typer.Option(help="Original source cluster (now offline).")],
-    destination: Annotated[str, typer.Option(help="Original destination cluster (now active).")],
-    namespace:   Annotated[Optional[str], typer.Option("--namespace", "-n", help="Limit scope to a single namespace.")] = None,
+    vm_names: Annotated[List[str], typer.Argument(help="VM name(s) to return to their original site.")],
+    namespace: NsOpt,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    no_reprotect: Annotated[bool, typer.Option("--no-reprotect", help="Do not re-establish replication "
+                                               "afterwards.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
 ):
     """
-    Advisory failback guide — shows the path to restore the original primary site.
-
-    After a successful failover the DR cluster is running production workloads.
-    This command shows what is running there and prints the exact command to
-    return the original primary cluster to its primary role.
-
-    It does NOT start/stop any VMs — it is an advisory and documentation step.
+    Returns VMs to the other site: planned failover from the current primary (lossless: stop, final sync,
+    promote, start), then reprotect so replication runs in the original direction again.
+    The VMs must have been reprotected after the original failover (so the old site holds a current copy).
     """
     config = load_config()
-
-    console.print(Panel(
-        f"[bold yellow]FAILBACK — Restore Primary Site[/bold yellow]\n\n"
-        f"  Current state (post-failover):\n"
-        f"    Active site    → [green]{destination}[/green]  (running production workloads)\n"
-        f"    Offline site   → [red]{source}[/red]  (needs recovery)\n\n"
-        f"  Goal after failback:\n"
-        f"    Primary site   → [bold green]{source}[/bold green]  (restored to original role)\n"
-        f"    DR site        → [bold cyan]{destination}[/bold cyan]  (standing by)",
-        title="Failback",
-        border_style="yellow",
-    ))
-
-    # Show what is now running on the active (destination) cluster
-    _, client_active = get_clients(config, source, destination)
-    with console.status(f"[cyan]Fetching VMs from active cluster '{destination}'...[/cyan]"):
-        data = client_active.get_vms()
-
-    if not data:
-        console.print("[red]Could not retrieve VM data from active cluster.[/red]")
-        return
-
-    running = [
-        (v["metadata"]["namespace"], v["metadata"]["name"])
-        for v in data.get("items", [])
-        if v.get("status", {}).get("printableStatus") == "Running"
-    ]
-
-    if namespace:
-        running = [(ns, name) for ns, name in running if ns == namespace]
-
-    scope_label = f"namespace '{namespace}'" if namespace else "all namespaces"
-    t = Table(title=f"Running VMs on '{destination}' ({scope_label})", box=box.ROUNDED)
-    t.add_column("Namespace", style="cyan")
-    t.add_column("VM Name",   style="magenta")
-    for ns, name in sorted(running):
-        t.add_row(ns, name)
-    console.print(t)
-
-    if namespace:
-        failback_cmd = f"harvey failover namespace {namespace} --source {destination} --destination {source}"
-    else:
-        failback_cmd = f"harvey failover all --source {destination} --destination {source}"
-
-    console.print(f"\n[dim]This command is advisory only — no VMs have been started or stopped.[/dim]")
-    console.print(f"\n[bold]Next steps to restore '{source}' as primary:[/bold]")
-    console.print(f"  1. Recover the original '{source}' cluster infrastructure.")
-    console.print(f"  2. Ensure VMs on '{source}' are in Stopped state.")
-    console.print(f"  3. Run the failback — this returns '{source}' to its primary role:")
-    console.print(f"\n     [bold cyan]{failback_cmd}[/bold cyan]\n")
-    console.print(f"  4. Optionally update your recovery plan source/destination fields.")
-
-    _audit("failback_guidance", {"original_source": source, "active_cluster": destination,
-                                   "namespace": namespace, "running_vms": len(running)})
+    a, b = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [a, b])
+    groups: dict = {}
+    for vm in vm_names:
+        p, r = _pair_for_vm(rep, namespace, vm, a, b)
+        groups.setdefault((p, r), []).append(vm)
+    for (p, r), vms in groups.items():
+        cs, cd = make_client(config, p), make_client(config, r)
+        vms_src, vms_dst = _fetch_vm_maps(cs, cd)
+        if vms_src is None:
+            raise typer.Exit(1)
+        plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace, vm_names_filter=vms)
+        console.print(Panel(f"Failback {', '.join(vms)}: [green]{p}[/green] → [bold]{r}[/bold]"
+                            + ("" if no_reprotect else f", then reprotect {r} → {p}"), border_style="yellow"))
+        _ad_hoc_failover(config, plan, p, r, yes, False, hint=no_reprotect)
+        if no_reprotect:
+            continue
+        for vm in vms:
+            try:
+                for line in rep.reprotect(namespace, vm, r, p):
+                    console.print(f"  {line}")
+                _audit("vm_reprotected", {"namespace": namespace, "vm": vm, "primary": r, "replica": p})
+            except (ReplicationError, KubeError, OntapError) as e:
+                console.print(f"  [bold red]✗ reprotect {vm}: {e}[/bold red]")
 
 
 # ── failover subcommands ──────────────────────────────────────────────────────
+UnplannedOpt = Annotated[bool, typer.Option("--unplanned", help="Source site is down: skip stop and final sync; "
+                                            "promote the last replicated data (data loss up to the lag).")]
+ForceOpt = Annotated[bool, typer.Option("--force", help="With --unplanned: proceed even if the VM still runs on "
+                                        "the source (split-brain risk).")]
+
+
 @failover_app.command("vm")
 def failover_vms(
-    vm_names:    Annotated[List[str], typer.Argument(help="VM name(s) to fail over.")],
-    namespace:   Annotated[str,  typer.Option("--namespace", "-n", help="Namespace of the VMs.")],
-    source:      Annotated[str,  typer.Option(help="Source cluster name.")],
-    destination: Annotated[str,  typer.Option(help="Destination cluster name.")],
-    yes:         Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation.")] = False,
-    dry_run:     Annotated[bool, typer.Option("--dry-run", help="Simulate without executing.")] = False,
+    vm_names: Annotated[List[str], typer.Argument(help="VM name(s) to fail over.")],
+    namespace: NsOpt,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation.")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Simulate without executing.")] = False,
+    unplanned: UnplannedOpt = False,
+    force: ForceOpt = False,
 ):
-    """Fails over one or more specific VMs by name."""
+    """Fails over specific protected VMs (stop → final sync → promote → start)."""
     config = load_config()
-    cs, cd = get_clients(config, source, destination)
-    vms_src, vms_dst_keys = _fetch_vm_maps(cs, cd)
-    if vms_src is None:
-        return
-    plan = _build_plan_from_inventory(vms_src, vms_dst_keys,
-                                      namespace_filter=namespace,
-                                      vm_names_filter=vm_names)
-    _ad_hoc_failover(cs, cd, plan, source, destination, yes, dry_run)
+    source, destination = resolve_pair(config, source, destination)
+    if unplanned:
+        plan = [(namespace, v, 0, 0) for v in vm_names]  # source may be unreachable: trust the replica side
+        cd = make_client(config, destination)
+        plan = [(ns, v, *_extract_labels(cd.get_vm(ns, v) or {"metadata": {}})) for ns, v, _, _ in plan]
+    else:
+        cs, cd = get_clients(config, source, destination)
+        vms_src, vms_dst = _fetch_vm_maps(cs, cd)
+        if vms_src is None:
+            raise typer.Exit(1)
+        plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace, vm_names_filter=vm_names)
+    _ad_hoc_failover(config, plan, source, destination, yes, dry_run, unplanned, force)
 
 
 @failover_app.command("namespace")
 def failover_namespace(
-    namespace:   Annotated[str,  typer.Argument(help="Namespace to fail over.")],
-    source:      Annotated[str,  typer.Option(help="Source cluster name.")],
-    destination: Annotated[str,  typer.Option(help="Destination cluster name.")],
-    yes:         Annotated[bool, typer.Option("--yes", "-y")] = False,
-    dry_run:     Annotated[bool, typer.Option("--dry-run")] = False,
+    namespace: Annotated[str, typer.Argument(help="Namespace to fail over.")],
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ):
-    """Fails over all running VMs in a namespace."""
+    """Fails over all running protected VMs in a namespace (planned)."""
     config = load_config()
+    source, destination = resolve_pair(config, source, destination)
     cs, cd = get_clients(config, source, destination)
-    vms_src, vms_dst_keys = _fetch_vm_maps(cs, cd)
+    vms_src, vms_dst = _fetch_vm_maps(cs, cd)
     if vms_src is None:
-        return
-    plan = _build_plan_from_inventory(vms_src, vms_dst_keys, namespace_filter=namespace)
-    _ad_hoc_failover(cs, cd, plan, source, destination, yes, dry_run)
+        raise typer.Exit(1)
+    plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace)
+    _ad_hoc_failover(config, plan, source, destination, yes, dry_run)
 
 
 @failover_app.command("all")
 def failover_all(
-    source:      Annotated[str,  typer.Option(help="Source cluster name.")],
-    destination: Annotated[str,  typer.Option(help="Destination cluster name.")],
-    yes:         Annotated[bool, typer.Option("--yes", "-y")] = False,
-    dry_run:     Annotated[bool, typer.Option("--dry-run")] = False,
+    source: SourceOpt = None,
+    destination: DestOpt = None,
+    yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ):
-    """Fails over all running VMs across all namespaces."""
+    """Fails over all running protected VMs across all namespaces (planned)."""
     config = load_config()
+    source, destination = resolve_pair(config, source, destination)
     cs, cd = get_clients(config, source, destination)
-    vms_src, vms_dst_keys = _fetch_vm_maps(cs, cd)
+    vms_src, vms_dst = _fetch_vm_maps(cs, cd)
     if vms_src is None:
-        return
-    plan = _build_plan_from_inventory(vms_src, vms_dst_keys)
-    _ad_hoc_failover(cs, cd, plan, source, destination, yes, dry_run)
+        raise typer.Exit(1)
+    plan = _build_plan_from_inventory(vms_src, vms_dst)
+    _ad_hoc_failover(config, plan, source, destination, yes, dry_run)
+
 
 
 # ── plan subcommands ──────────────────────────────────────────────────────────
@@ -1282,13 +1506,18 @@ def plan_run(
         help="Non-disruptive DR test: clones VMs into shadow namespaces on DR cluster "
              "and verifies they start. Production VMs are never touched.",
     )] = False,
+    unplanned: Annotated[bool, typer.Option("--unplanned", help="Source site down: promote + start only.")] = False,
+    force: Annotated[bool, typer.Option("--force", help="With --unplanned: ignore VMs still running on source.")] = False,
+    reverse: Annotated[bool, typer.Option("--reverse", help="Run the plan destination → source (failback).")] = False,
 ):
     """
     Executes a recovery plan.
 
     **Modes:**
 
-    - (default) Live failover — stops VMs on source, starts them on destination.
+    - (default) Planned failover — stop on source, final SnapMirror sync, promote, start on destination.
+    - `--unplanned` — source is down: promote the last replicated data and start (RPO = replication lag).
+    - `--reverse` — run it the other way round (failback), after `harvey reprotect`.
     - `--dry-run` — shows the ordered plan with no changes.
     - `--test`    — non-disruptive shadow DR test (mirrors SRM 'Test Recovery').
     """
@@ -1302,6 +1531,8 @@ def plan_run(
     destination       = data.get("destination")
     protection_groups = data.get("protection_groups", [])
     hooks             = data.get("hooks", {})
+    if reverse:
+        source, destination = destination, source
 
     if test:
         _run_plan_test(data, source, destination, protection_groups)
@@ -1316,7 +1547,6 @@ def plan_run(
     ]
 
     config = load_config()
-    cs, cd = get_clients(config, source, destination)
 
     console.print(Panel(
         f"[bold]{data.get('name', name)}[/bold]\n{data.get('description', '')}",
@@ -1332,15 +1562,15 @@ def plan_run(
 
     _audit("plan_run_started", {"plan": name, "source": source, "destination": destination,
                                 "dry_run": dry_run})
-    result = _execute_failover_plan(plan, cs, cd, hooks=hooks, dry_run=dry_run)
+    result = _execute_failover_plan(plan, config, source, destination, hooks=hooks, dry_run=dry_run,
+                                    unplanned=unplanned, force=force)
 
     if not dry_run:
         _print_failover_summary(result)
         _audit("plan_run_completed", {
-            "plan": name,
-            "started": len(result["started"]),
-            "failed":  len(result["failed_stop"]) + len(result["failed_start"]),
-            "rto_seconds": result.get("rto_seconds"),
+            "plan": name, "source": source, "destination": destination, "unplanned": unplanned,
+            "started": len(result["started"]), "failed": len(result["failed"]),
+            "rto_seconds": result.get("rto_seconds"), "rpo": result.get("rpo"),
         })
 
 
