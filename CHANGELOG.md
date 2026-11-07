@@ -2,6 +2,30 @@
 
 All notable changes to Harvey are documented here.
 
+## [0.3.0] — unreleased
+
+Pluggable storage backends and Portworx async DR.
+
+### Added
+- **Storage backend layer** (`harvey.backends`): `StorageBackend` interface plus a registry keyed by CSI driver.
+  The backend is picked per VM and recorded in `harvey.io/storage-backend`.
+- **Portworx backend**: Stork volume-only `MigrationSchedule` per VM (PV+PVC selected by `harvey.io/vm`),
+  final one-off Migration for planned failovers (RPO 0), fencing through Stork's `applicationActivated` flag with
+  `autoSuspend`, reprotect that replaces the old direction's schedules, `--delete-replica` restoring the PV reclaim
+  policy. See docs/portworx.md.
+- `harvey.io/primary-since`: after an unplanned failover the newer primary wins, the stale copy is shown in
+  `replication status` / `health-check` and demoted by `reprotect` (only while stopped)
+- `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
+
+### Changed
+- NetApp logic moved to `backends/netapp.py` without behaviour changes; 0.2 configs (top-level
+  `replication.policy` / `schedule`) still work
+- `health-check` and `replication status` ignore VMs protected towards a third cluster
+
+### Fixed
+- Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and
+  under-reported the loss by the transfer time)
+
 ## [0.2.0] — unreleased
 
 Storage-aware DR with NetApp ONTAP SnapMirror (through Trident TridentMirrorRelationships).
