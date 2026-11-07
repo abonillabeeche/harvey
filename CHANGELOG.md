@@ -13,6 +13,11 @@ Pluggable storage backends and Portworx async DR.
   final one-off Migration for planned failovers (RPO 0), fencing through Stork's `applicationActivated` flag with
   `autoSuspend`, reprotect that replaces the old direction's schedules, `--delete-replica` restoring the PV reclaim
   policy. See docs/portworx.md.
+- **Longhorn backend (alpha)**: Longhorn DR volumes, V1 and V2 data engines. Backups go to a shared Longhorn
+  BackupTarget (dedicated `harvey` target by default); standby DR volumes restore them incrementally; planned
+  failover = final backup + wait for its restore (RPO 0); promote = activate + PV/PVC from stored templates;
+  reprotect = DR volume of the new primary. Works around synced Backup CRs with `backupBlockSize: -1` and
+  Harvester's PVC-in-use webhook. V1 lab-tested between Longhorn 1.12.1 and 1.13.0; V2 untested. See docs/longhorn.md.
 - `harvey.io/primary-since`: after an unplanned failover the newer primary wins, the stale copy is shown in
   `replication status` / `health-check` and demoted by `reprotect` (only while stopped)
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`

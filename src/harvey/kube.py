@@ -48,6 +48,14 @@ GROUPS = {
     "migration":         ("apis/stork.libopenstorage.org/v1alpha1", "migrations"),
     "migrationschedule": ("apis/stork.libopenstorage.org/v1alpha1", "migrationschedules"),
     "schedulepolicy":    ("apis/stork.libopenstorage.org/v1alpha1", "schedulepolicies"),
+    "dv":             ("apis/cdi.kubevirt.io/v1beta1", "datavolumes"),
+    "lhvolume":       ("apis/longhorn.io/v1beta2", "volumes"),
+    "lhsnapshot":     ("apis/longhorn.io/v1beta2", "snapshots"),
+    "lhbackup":       ("apis/longhorn.io/v1beta2", "backups"),
+    "lhbackupvolume": ("apis/longhorn.io/v1beta2", "backupvolumes"),
+    "lhbackuptarget": ("apis/longhorn.io/v1beta2", "backuptargets"),
+    "lhrecurringjob": ("apis/longhorn.io/v1beta2", "recurringjobs"),
+    "lhbackingimage": ("apis/longhorn.io/v1beta2", "backingimages"),
     "clusternetwork": ("apis/network.harvesterhci.io/v1beta1", "clusternetworks"),
     "storageclass":   ("apis/storage.k8s.io/v1", "storageclasses"),
 }
@@ -153,8 +161,9 @@ class KubeClient:
     def replace(self, kind: str, namespace: Optional[str], name: str, body: dict):
         return self.request("PUT", path(kind, namespace, name), json_body=body)
 
-    def delete(self, kind: str, namespace: Optional[str], name: str):
-        return self.request("DELETE", path(kind, namespace, name), allow_404=True)
+    def delete(self, kind: str, namespace: Optional[str], name: str, propagation: Optional[str] = None):
+        body = {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": propagation} if propagation else None
+        return self.request("DELETE", path(kind, namespace, name), json_body=body, allow_404=True)
 
     def apply(self, kind: str, namespace: Optional[str], body: dict) -> str:
         """Create, or update in place keeping resourceVersion. Returns 'created' / 'updated'."""

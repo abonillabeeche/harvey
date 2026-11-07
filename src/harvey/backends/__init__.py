@@ -27,6 +27,6 @@ def backend_for_driver(driver: Optional[str]) -> Optional[str]:
 
 
 # built-in backends (import registers them)
-from . import netapp, portworx  # noqa: E402,F401
+from . import longhorn, netapp, portworx  # noqa: E402,F401
 
 __all__ = ["REGISTRY", "StorageBackend", "backend_for_driver", "register"]

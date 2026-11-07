@@ -24,7 +24,12 @@ class FakeKube:
         return copy.deepcopy(o) if o else None
 
     def list(self, kind, ns=None, label_selector=None):
-        return [copy.deepcopy(o) for (k, n, _), o in self.objs.items() if k == kind and (ns is None or n == ns)]
+        out = [copy.deepcopy(o) for (k, n, _), o in self.objs.items() if k == kind and (ns is None or n == ns)]
+        if label_selector:
+            for term in label_selector.split(","):
+                key, _, val = term.partition("=")
+                out = [o for o in out if (o["metadata"].get("labels") or {}).get(key) == val]
+        return out
 
     def create(self, kind, ns, body):
         self.objs[(kind, ns, body["metadata"]["name"])] = copy.deepcopy(body)
@@ -76,7 +81,8 @@ def test_registry_and_driver_mapping():
     assert set(REGISTRY) >= {"netapp", "portworx"}
     assert backend_for_driver("csi.trident.netapp.io") == "netapp"
     assert backend_for_driver("pxd.portworx.com") == "portworx"
-    assert backend_for_driver("driver.longhorn.io") is None
+    assert backend_for_driver("driver.longhorn.io") == "longhorn"
+    assert backend_for_driver("rbd.csi.ceph.com") is None
 
 
 def test_detect_backend_from_pv_driver_and_annotation():
@@ -90,7 +96,7 @@ def test_detect_backend_from_pv_driver_and_annotation():
 
 
 def test_detect_backend_rejects_unsupported_and_mixed():
-    k = FakeKube("a", [("pvc", "demo", _pvc("r", "demo", "pv1")), ("pv", None, _pv("pv1", "driver.longhorn.io")),
+    k = FakeKube("a", [("pvc", "demo", _pvc("r", "demo", "pv1")), ("pv", None, _pv("pv1", "rbd.csi.ceph.com")),
                        ("pvc", "demo", _pvc("d1", "demo", "pv2")), ("pv", None, _pv("pv2", "pxd.portworx.com")),
                        ("pvc", "demo", _pvc("d2", "demo", "pv3")), ("pv", None, _pv("pv3", "csi.trident.netapp.io"))])
     rep = Replicator({"a": k}, {}, log=lambda *_: None)
@@ -219,3 +225,89 @@ def test_direction_resolves_stale_primary_after_unplanned_failover():
     del old["metadata"]["annotations"]["harvey.io/primary-since"]
     rep2 = Replicator({"a": FakeKube("a", [("vm", "demo", old)]), "b": FakeKube("b", [("vm", "demo", new)])}, {}, print)
     assert rep2.direction("demo", "vm1", "a", "b") == (None, None)
+
+
+
+# ── Longhorn ──────────────────────────────────────────────────────────────────
+import json as _json
+
+from harvey.backends.longhorn import A_PV, A_PVC, L_GROUP, LonghornBackend
+
+
+def _lh_dr_cluster(standby=True, last="backup-aaa", snap_time="2026-11-07T10:00:00Z"):
+    pv_t = {"name": "pvc-123", "spec": {"accessModes": ["ReadWriteMany"], "capacity": {"storage": "1Gi"},
+                                         "csi": {"driver": "driver.longhorn.io", "volumeHandle": "pvc-123",
+                                                 "volumeAttributes": {"numberOfReplicas": "2"}},
+                                         "volumeMode": "Block", "storageClassName": "tworeplicas",
+                                         "persistentVolumeReclaimPolicy": "Delete"}}
+    pvc_t = {"labels": {}, "annotations": {}, "spec": {"accessModes": ["ReadWriteMany"], "volumeMode": "Block",
+                                                      "resources": {"requests": {"storage": "1Gi"}},
+                                                      "storageClassName": "tworeplicas"}}
+    vol = {"metadata": {"name": "pvc-123", "namespace": "longhorn-system",
+                        "labels": {"harvey.io/managed": "true", "harvey.io/vm-claim": "demo.vm1-root"},
+                        "annotations": {A_PV: _json.dumps(pv_t), A_PVC: _json.dumps(pvc_t)}},
+           "spec": {"Standby": standby, "frontend": ""},
+           "status": {"isStandby": standby, "lastBackup": last}}
+    bk = {"metadata": {"name": last, "namespace": "longhorn-system"}, "status": {"snapshotCreatedAt": snap_time}}
+    return FakeKube("b", [("lhvolume", "longhorn-system", vol), ("lhbackup", "longhorn-system", bk)])
+
+
+class _ActivatingKube(FakeKube):
+    """Longhorn flips status.isStandby after spec.Standby=false; a bound PVC appears once created."""
+    def merge_patch(self, kind, ns, name, patch):
+        r = super().merge_patch(kind, ns, name, patch)
+        if kind == "lhvolume" and patch.get("spec", {}).get("Standby") is False:
+            self.objs[(kind, ns, name)]["status"]["isStandby"] = False
+        return r
+
+    def create(self, kind, ns, body):
+        body = copy.deepcopy(body)
+        if kind == "pvc":
+            body["status"] = {"phase": "Bound"}
+        return super().create(kind, ns, body)
+
+
+def test_lh_preflight_requires_standby_dr_volume_with_a_restored_backup():
+    be = LonghornBackend({"b": _lh_dr_cluster()}, {}, {"tmr": 1, "transfer": 1}, print)
+    be.preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+    be2 = LonghornBackend({"b": _lh_dr_cluster(last="")}, {}, {}, print)
+    with pytest.raises(ReplicationError, match="has not restored any backup"):
+        be2.preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+    be3 = LonghornBackend({"b": _lh_dr_cluster(standby=False)}, {}, {}, print)
+    with pytest.raises(ReplicationError, match="not a standby DR volume"):
+        be3.preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+
+
+def test_lh_promote_activates_and_creates_pv_pvc_from_templates():
+    b = _ActivatingKube("b", list((k, n, o) for (k, n, _), o in _lh_dr_cluster().objs.items()))
+    be = LonghornBackend({"b": b}, {}, {"tmr": 1, "transfer": 1}, lambda *_: None)
+    be.promote("a", "b", "demo", "vm1", ["vm1-root"], src_up=False, unplanned=True)
+    vol = b.get("lhvolume", "longhorn-system", "pvc-123")
+    assert vol["spec"]["Standby"] is False and vol["spec"]["frontend"] == "blockdev"
+    pv = b.get("pv", None, "pvc-123")
+    assert pv["spec"]["claimRef"] == {"namespace": "demo", "name": "vm1-root"}
+    assert pv["spec"]["csi"]["volumeHandle"] == "pvc-123" and pv["spec"]["volumeMode"] == "Block"
+    pvc = b.get("pvc", "demo", "vm1-root")
+    assert pvc["spec"]["volumeName"] == "pvc-123" and pvc["spec"]["storageClassName"] == "tworeplicas"
+
+
+def test_lh_unplanned_rpo_from_last_restored_backup_snapshot_time():
+    t = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    be = LonghornBackend({"b": _lh_dr_cluster(snap_time=t)}, {}, {}, print)
+    age = be.recovery_point_age("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+    assert 295 <= age <= 305
+
+
+def test_lh_status_reports_up_to_date_standby():
+    a = FakeKube("a", [("pvc", "demo", _pvc("vm1-root", "demo", "pvc-123")),
+                       ("pv", None, {"metadata": {"name": "pvc-123"},
+                                     "spec": {"csi": {"driver": "driver.longhorn.io", "volumeHandle": "pvc-123"}}}),
+                       ("lhvolume", "longhorn-system", {"metadata": {"name": "pvc-123", "labels": {L_GROUP: "enabled"}},
+                                                        "spec": {"dataEngine": "v2"}}),
+                       ("lhbackupvolume", "longhorn-system", {"metadata": {"name": "bv-1"},
+                                                              "spec": {"backupTargetName": "harvey", "volumeName": "pvc-123"},
+                                                              "status": {"lastBackupName": "backup-aaa"}})])
+    be = LonghornBackend({"a": a, "b": _lh_dr_cluster()}, {}, {}, print)
+    (row,) = be.volume_status("a", "b", "demo", "vm1", ["vm1-root"])
+    assert row.src_state == "backup/5m" and row.dst_state == "standby" and row.repl_state == "up to date"
+    assert row.healthy is True and "v2" in row.note and "alpha" in row.note
