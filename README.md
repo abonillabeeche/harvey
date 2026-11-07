@@ -7,8 +7,13 @@
 Harvey automates storage-aware Disaster Recovery of virtual machines between two KubeVirt
 (SUSE Virtualization / Harvester) clusters:
 
-- **Disks** are replicated by **NetApp ONTAP SnapMirror**, driven through Trident
-  `TridentMirrorRelationship` (TMR) objects, so the replica volumes are normal PVCs on the DR cluster.
+- **Disks** are replicated by a pluggable **storage backend**, picked per VM from the CSI driver of its PVs:
+  - `netapp`: **NetApp ONTAP SnapMirror**, driven through Trident `TridentMirrorRelationship` (TMR) objects
+  - `portworx`: **Portworx async DR**, driven through a Stork `MigrationSchedule` (volume-only), see
+    [docs/portworx.md](docs/portworx.md)
+
+  In both cases the replica volumes are normal PVCs on the DR cluster. To add another engine, implement
+  `harvey.backends.base.StorageBackend` and register it.
 - **Metadata** (the VM spec, cloud-init / credential Secrets, ConfigMaps, NetworkAttachmentDefinitions) is
   copied by Harvey. The replica VM sits on the DR cluster, stopped.
 - **Failover** = stop on source → final SnapMirror update → promote the replica volumes → start on DR

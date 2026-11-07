@@ -44,10 +44,14 @@ GROUPS = {
     "tmr":       ("apis/trident.netapp.io/v1", "tridentmirrorrelationships"),
     "tvol":      ("apis/trident.netapp.io/v1", "tridentvolumes"),
     "tbc":       ("apis/trident.netapp.io/v1", "tridentbackendconfigs"),
+    "clusterpair":       ("apis/stork.libopenstorage.org/v1alpha1", "clusterpairs"),
+    "migration":         ("apis/stork.libopenstorage.org/v1alpha1", "migrations"),
+    "migrationschedule": ("apis/stork.libopenstorage.org/v1alpha1", "migrationschedules"),
+    "schedulepolicy":    ("apis/stork.libopenstorage.org/v1alpha1", "schedulepolicies"),
     "clusternetwork": ("apis/network.harvesterhci.io/v1beta1", "clusternetworks"),
     "storageclass":   ("apis/storage.k8s.io/v1", "storageclasses"),
 }
-CLUSTER_SCOPED = {"pv", "namespace", "clusternetwork", "storageclass"}
+CLUSTER_SCOPED = {"pv", "namespace", "clusternetwork", "storageclass", "schedulepolicy"}
 
 
 def path(kind: str, namespace: Optional[str] = None, name: Optional[str] = None) -> str:

@@ -3,9 +3,11 @@
 Harvey - DR Orchestration CLI for KubeVirt / SUSE Virtualization
 
 Storage-aware disaster recovery across two sites:
-  - NetApp ONTAP SnapMirror (driven through Trident TridentMirrorRelationships) replicates the VM disks
+  - a storage backend replicates the VM disks (pluggable, see harvey.backends):
+      netapp    : NetApp ONTAP SnapMirror, driven through Trident TridentMirrorRelationships
+      portworx  : Portworx async DR, driven through Stork ClusterPair + MigrationSchedule
   - Harvey replicates the metadata (VM spec, cloud-init/credential Secrets, ConfigMaps, NADs)
-  - Failover  : stop on source -> final SnapMirror update -> promote replica volumes -> start on DR
+  - Failover  : stop on source -> final sync -> promote replica volumes -> start on DR
   - Reprotect : reverse resync so the old primary becomes the replica; failback = failover + reprotect
 
 Also: recovery plans (priority groups, hooks), RTO/RPO tracking, JSONL audit log, health checks,
@@ -37,6 +39,8 @@ from .kube import KubeClient, KubeError
 from .ontap import OntapError
 from .replication import (L_ROLE, A_REPROTECT, ReplicationError, Replicator, vm_status as _vm_printable)
 
+ERRORS = (ReplicationError, KubeError, OntapError)
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 CONFIG_DIR  = Path(os.environ.get("HARVEY_CONFIG_DIR", Path.home() / ".config" / "harvey"))
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
@@ -52,15 +56,25 @@ CONFIG_TEMPLATE = {
         "primary": {"rancher_cluster_id": "c-m-xxxxxxxx"},
         # ... or a kubeconfig (token or client-cert auth); context optional.
         "dr":      {"kubeconfig": "~/.kube/dr.yaml"},
-        # ONTAP credentials are discovered from each cluster's Trident backend (managementLIF + Secret).
+        # NetApp: ONTAP credentials are discovered from each cluster's Trident backend (managementLIF + Secret).
         # Override per cluster with:  ontap: {host: 192.0.2.10, username: vsadmin, password: ...}
     },
     "defaults": {"source": "primary", "destination": "dr"},
     "replication": {
-        "policy":   "MirrorAllSnapshots",   # an async SnapMirror policy (Trident supports async only)
-        "schedule": "5min",                 # an ONTAP job schedule on the destination cluster
-        "storage_class_map": {},            # source SC -> destination SC, when names differ
+        # backend: netapp | portworx   # optional; default = picked per VM from the CSI driver of its PVs
+        "storage_class_map": {},            # source SC -> destination SC, when names differ (NetApp)
         "max_lag_seconds": 900,             # health-check threshold
+        "netapp": {
+            "policy":   "MirrorAllSnapshots",   # an async SnapMirror policy (Trident supports async only)
+            "schedule": "5min",                 # an ONTAP job schedule on the destination cluster
+        },
+        "portworx": {
+            "interval_minutes": 15,             # Stork SchedulePolicy harvey-<N>min
+            "pairs": {                          # Stork ClusterPair per direction ("name" in the VM ns, or "ns/name")
+                "primary->dr": "harvey-to-dr",
+                "dr->primary": "harvey-to-primary",
+            },
+        },
     },
 }
 
@@ -129,7 +143,7 @@ app          = typer.Typer(help="Harvey — DR orchestration CLI for KubeVirt/SU
 config_app   = typer.Typer(help="Manage CLI configuration.")
 failover_app = typer.Typer(help="Ad-hoc failover operations.")
 plan_app     = typer.Typer(help="Manage and execute recovery plans.")
-repl_app     = typer.Typer(help="Replication (SnapMirror) state of protected VMs.")
+repl_app     = typer.Typer(help="Replication state of protected VMs (SnapMirror / Portworx async DR).")
 
 app.add_typer(config_app,   name="config")
 app.add_typer(failover_app, name="failover")
@@ -274,16 +288,14 @@ def resolve_pair(config: dict, source: Optional[str], destination: Optional[str]
 
 def make_replicator(config: dict, names: List[str]) -> Replicator:
     clients = {n: make_client(config, n) for n in names}
-    overrides = {}
+    cluster_config = {}
     for n in names:
-        c = config["clusters"].get(n)
-        if isinstance(c, dict) and c.get("ontap"):
-            o = dict(c["ontap"])
-            if o.get("password_env"):
-                o["password"] = os.environ.get(o["password_env"], "")
-            overrides[n] = o
+        c = copy.deepcopy(config["clusters"].get(n) or {})
+        if isinstance(c, dict) and c.get("ontap") and c["ontap"].get("password_env"):
+            c["ontap"]["password"] = os.environ.get(c["ontap"]["password_env"], "")
+        cluster_config[n] = c
     return Replicator(clients, config.get("replication") or {}, log=console.print,
-                      ontap_overrides=overrides, debug=state["debug"])
+                      cluster_config=cluster_config, debug=state["debug"])
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -459,7 +471,7 @@ def _execute_failover_plan(
 ) -> dict:
     """
     Storage-aware failover. Planned: metadata sync -> stop on source (lowest priority first) ->
-    final SnapMirror update per volume -> promote replica volumes -> start on destination
+    final sync (storage backend) -> promote replica volumes -> start on destination
     (highest priority first). Unplanned: promote + start only, data loss up to the replication lag.
     """
     hooks = hooks or {}
@@ -468,7 +480,7 @@ def _execute_failover_plan(
 
     if dry_run:
         console.print("\n[bold yellow]DRY RUN — no changes will be made.[/bold yellow]")
-        steps = (["metadata sync", "stop (lowest priority first)", "final SnapMirror update"]
+        steps = (["metadata sync", "stop (lowest priority first)", "final sync"]
                  if not unplanned else []) + ["promote replica volumes", "start (highest priority first)"]
         console.print("  Phases: " + " → ".join(steps))
         for ns, vm, prio, _ in sorted(plan, key=lambda x: x[2]):
@@ -483,7 +495,7 @@ def _execute_failover_plan(
 
     try:
         r = rep.failover(plan, source, destination, unplanned=unplanned, force=force, hooks_cb=hook_cb)
-    except (ReplicationError, KubeError, OntapError) as e:
+    except ERRORS as e:
         console.print(f"\n[bold red]Failover aborted: {e}[/bold red]")
         _audit("failover_aborted", {"source": source, "destination": destination, "error": str(e)})
         return {**empty, "failed": [("-", "preflight", str(e))]}
@@ -574,8 +586,8 @@ def _ad_hoc_failover(
         return
     _display_plan_table(plan, source, destination, dry_run=dry_run)
     if unplanned:
-        console.print("[bold red]UNPLANNED failover: no final sync — data written after the last SnapMirror "
-                      "transfer is lost.[/bold red]")
+        console.print("[bold red]UNPLANNED failover: no final sync — data written after the last replication "
+                      "cycle is lost.[/bold red]")
     if not yes and not dry_run:
         if not Confirm.ask("\nProceed with this failover?"):
             console.print("Aborted.")
@@ -997,7 +1009,7 @@ def health_check(
     rep = make_replicator(config, [cluster1, cluster2])
     max_lag = int((config.get("replication") or {}).get("max_lag_seconds", 900))
     protected = rep.protected_vms()
-    console.print(f"\n  Protected VMs (SnapMirror): [bold]{len(protected)}[/bold]  (max lag {max_lag}s)")
+    console.print(f"\n  Protected VMs: [bold]{len(protected)}[/bold]  (max lag {max_lag}s)")
     for ns, name in protected:
         p, r = rep.direction(ns, name, cluster1, cluster2)
         if not p:
@@ -1006,18 +1018,22 @@ def health_check(
             continue
         try:
             rows = rep.volume_status(ns, name, p, r)
-        except (ReplicationError, KubeError, OntapError) as e:
+        except ERRORS as e:
             console.print(f"    [red]✗ {ns}/{name}: {e}[/red]")
             all_ok = False
             continue
-        bad = [v for v in rows if v.sm_state != "snapmirrored" or (v.lag_s or 0) > max_lag]
+        bad = [v for v in rows if v.healthy is not True or (v.lag_s or 0) > max_lag]
         rv = rep.k[r].get("vm", ns, name)
-        if ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT):
+        if rep.stale_primary.get((ns, name)):
+            console.print(f"    [yellow]⚠ {ns}/{name}: primary on {p} since an unplanned failover; {r} still holds "
+                          f"a stale primary copy — keep it stopped and run harvey reprotect[/yellow]")
+            all_ok = False
+        elif ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT):
             console.print(f"    [yellow]⚠ {ns}/{name}: running on {p} without protection — run harvey reprotect[/yellow]")
             all_ok = False
         elif bad:
             for v in bad:
-                console.print(f"    [red]✗ {ns}/{name} {v.claim}: {v.sm_state}, lag {_fmt_lag(v.lag_s)} {v.note}[/red]")
+                console.print(f"    [red]✗ {ns}/{name} {v.claim}: {v.repl_state}, lag {_fmt_lag(v.lag_s)} {v.note}[/red]")
             all_ok = False
         else:
             worst = max((v.lag_s or 0) for v in rows) if rows else 0
@@ -1096,11 +1112,12 @@ def protect(
     namespace: NsOpt,
     source: SourceOpt = None,
     destination: DestOpt = None,
-    wait: Annotated[bool, typer.Option("--wait", help="Wait for the SnapMirror baseline transfer.")] = False,
+    wait: Annotated[bool, typer.Option("--wait", help="Wait for the baseline transfer.")] = False,
 ):
     """
-    Protects VMs: replicates every PVC with SnapMirror (Trident TMRs) and copies the VM spec, Secrets,
-    ConfigMaps and NADs to the destination, where the replica VM is created stopped.
+    Protects VMs: replicates every PVC with the VM's storage backend (NetApp SnapMirror via Trident TMRs, or
+    Portworx async DR via a Stork MigrationSchedule) and copies the VM spec, Secrets, ConfigMaps and NADs to
+    the destination, where the replica VM is created stopped.
     """
     config = load_config()
     source, destination = resolve_pair(config, source, destination)
@@ -1113,7 +1130,7 @@ def protect(
                 console.print(f"  {line}")
             _audit("vm_protected", {"namespace": namespace, "vm": vm, "source": source, "destination": destination})
             console.print(f"  [green]✓ {namespace}/{vm} protected[/green]")
-        except (ReplicationError, KubeError, OntapError) as e:
+        except ERRORS as e:
             rc = 1
             console.print(f"  [bold red]✗ {e}[/bold red]")
     if rc:
@@ -1130,7 +1147,7 @@ def unprotect(
                                                  "and copied Secrets on the replica side.")] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y")] = False,
 ):
-    """Stops replication for VMs (deletes the TMRs; the replica volumes become independent read-write copies)."""
+    """Stops replication for VMs (deletes the TMRs / MigrationSchedule; the replica volumes become independent copies)."""
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
@@ -1159,7 +1176,7 @@ def sync(
 ):
     """
     Re-copies VM metadata (spec, Secrets, ConfigMaps, NADs) from each VM's primary to its replica.
-    Disks are replicated by SnapMirror on its own schedule; this keeps the small stuff in step.
+    Disks are replicated by the storage backend on its own schedule; this keeps the small stuff in step.
     """
     config = load_config()
     a, b = resolve_pair(config, source, destination)
@@ -1197,7 +1214,7 @@ def replication_status(
     source: SourceOpt = None,
     destination: DestOpt = None,
 ):
-    """Per-volume replication state of protected VMs: TMR states, SnapMirror state, health, lag, recovery point."""
+    """Per-volume replication state of protected VMs: relationship states, engine state, health, lag, recovery point."""
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
@@ -1208,37 +1225,44 @@ def replication_status(
     t = Table(title="Replication status", box=box.ROUNDED)
     t.add_column("VM / direction / state", no_wrap=True)
     t.add_column("Volume", no_wrap=True)
-    for col in ("TMR pri→rep", "SnapMirror", "Healthy", "Lag", "Recovery point"):
+    for col in ("Backend", "State pri→rep", "Replication", "Healthy", "Lag", "Recovery point"):
         t.add_column(col, overflow="fold")
     t.add_column("Note", overflow="fold", max_width=40)
-    short = {"promoted": "prom", "established": "est", "reestablished": "re-est", "-": "-"}
+    short = {"promoted": "prom", "established": "est", "reestablished": "re-est", "suspended": "susp", "-": "-"}
     worst = 0
     for ns, vm in vms:
         p, r = rep.direction(ns, vm, a, b)
         if not p:
-            t.add_row(f"{ns}/{vm}\n[red]direction unclear[/red]", "", "", "", "", "", "", "")
+            t.add_row(f"{ns}/{vm}\n[red]direction unclear[/red]", "", "", "", "", "", "", "", "")
             continue
         pv = rep.k[p].get("vm", ns, vm)
         rv = rep.k[r].get("vm", ns, vm)
         vstate = f"{_vm_printable(pv)} / {_vm_printable(rv)}"
+        if rep.stale_primary.get((ns, vm)):
+            vstate += f"\n[yellow]stale primary on {r}[/yellow]"
         if _vm_printable(pv) == "Running" and _vm_printable(rv) == "Running":
             vstate = "[bold white on red]SPLIT BRAIN[/bold white on red]"
         reprot = ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT)
-        rows = rep.volume_status(ns, vm, p, r)
+        try:
+            be = rep.backend_of(ns, vm, p).name
+            rows = rep.volume_status(ns, vm, p, r)
+        except ERRORS as e:
+            t.add_row(f"[bold]{ns}/{vm}[/bold]", "", "", "", "", "", "", "", f"[red]{str(e)[:120]}[/red]")
+            continue
         for i, vs in enumerate(rows):
             worst = max(worst, vs.lag_s or 0)
             healthy = "-" if vs.healthy is None else ("[green]yes[/green]" if vs.healthy else "[red]no[/red]")
             note = vs.note or ("needs reprotect" if reprot else "")
             first = {0: f"[bold]{ns}/{vm}[/bold]", 1: f"{p} → {r}", 2: vstate}.get(i, "")
-            t.add_row(first, vs.claim, f"{short.get(vs.src_tmr, vs.src_tmr)}→{short.get(vs.dst_tmr, vs.dst_tmr)}",
-                      vs.sm_state, healthy, _fmt_lag(vs.lag_s),
+            t.add_row(first, vs.claim, be if i == 0 else "",
+                      f"{short.get(vs.src_state, vs.src_state)}→{short.get(vs.dst_state, vs.dst_state)}",
+                      vs.repl_state, healthy, _fmt_lag(vs.lag_s),
                       vs.recovery_point.strftime("%H:%M:%S") if vs.recovery_point else "-", note)
         for extra in ([f"{p} → {r}", vstate][len(rows) - 1:] if len(rows) < 3 else []):
-            t.add_row(extra, "", "", "", "", "", "", "")
+            t.add_row(extra, "", "", "", "", "", "", "", "")
     console.print(t)
-    console.print(f"Worst lag: [bold]{_fmt_lag(worst)}[/bold]  (schedule "
-                  f"'{(config.get('replication') or {}).get('schedule', '5min')}'; lag = age of the newest "
-                  f"replicated snapshot = worst-case data loss if the primary site fails now)")
+    console.print(f"Worst lag: [bold]{_fmt_lag(worst)}[/bold]  (lag = age of the newest replicated recovery "
+                  f"point = worst-case data loss if the primary site fails now)")
 
 
 @app.command("reprotect")
@@ -1266,7 +1290,7 @@ def reprotect(
                 console.print(f"  {line}")
             _audit("vm_reprotected", {"namespace": namespace, "vm": vm, "primary": p, "replica": r})
             console.print(f"  [green]✓ {namespace}/{vm} replicating {p} → {r}[/green]")
-        except (ReplicationError, KubeError, OntapError) as e:
+        except ERRORS as e:
             console.print(f"  [bold red]✗ {e}[/bold red]")
             raise typer.Exit(1)
 
@@ -1310,7 +1334,7 @@ def failback(
                 for line in rep.reprotect(namespace, vm, r, p):
                     console.print(f"  {line}")
                 _audit("vm_reprotected", {"namespace": namespace, "vm": vm, "primary": r, "replica": p})
-            except (ReplicationError, KubeError, OntapError) as e:
+            except ERRORS as e:
                 console.print(f"  [bold red]✗ reprotect {vm}: {e}[/bold red]")
 
 
@@ -1515,7 +1539,7 @@ def plan_run(
 
     **Modes:**
 
-    - (default) Planned failover — stop on source, final SnapMirror sync, promote, start on destination.
+    - (default) Planned failover — stop on source, final sync (storage backend), promote, start on destination.
     - `--unplanned` — source is down: promote the last replicated data and start (RPO = replication lag).
     - `--reverse` — run it the other way round (failback), after `harvey reprotect`.
     - `--dry-run` — shows the ordered plan with no changes.

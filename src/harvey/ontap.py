@@ -85,6 +85,13 @@ class OntapClient:
         recs = d.get("records", [])
         return recs[0] if recs else None
 
+    def relationship_by_source(self, source_path: str) -> Optional[dict]:
+        """Relationship whose source is 'svm:volume' (queried on the destination ONTAP)."""
+        d = self._req("GET", "snapmirror/relationships",
+                      params={"source.path": source_path, "fields": REL_FIELDS})
+        recs = d.get("records", [])
+        return recs[0] if recs else None
+
     def update(self, rel_uuid: str) -> str:
         """Starts a SnapMirror update (transfer). Returns the transfer uuid (may be '' if ONTAP returns a job)."""
         d = self._req("POST", f"snapmirror/relationships/{rel_uuid}/transfers",
