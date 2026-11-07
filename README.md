@@ -75,16 +75,16 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 ```mermaid
 flowchart LR
     subgraph A["Site A: primary"]
-        VMA["VM px-demo-1<br/>Running"]
+        VMA["VM app-01<br/>Running"]
         DA[("root + data<br/>PVCs")]
         VMA --- DA
     end
     subgraph B["Site B: DR"]
-        VMB["VM px-demo-1<br/>Halted replica"]
+        VMB["VM app-01<br/>Halted replica"]
         DB[("replica<br/>PVCs")]
         VMB --- DB
     end
-    H(["🦫 harvey"])
+    H(["harvey"])
     DA == "storage backend<br/>SnapMirror · Portworx" ==> DB
     H -. "VM spec · Secrets<br/>ConfigMaps · NADs" .-> VMB
     H -. "stop · final sync<br/>promote · start" .-> A
@@ -173,7 +173,7 @@ primary.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant H as 🦫 harvey
+    participant H as harvey
     participant A as Site A (primary)
     participant S as Storage
     participant B as Site B (DR)
