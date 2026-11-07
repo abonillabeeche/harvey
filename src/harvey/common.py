@@ -16,6 +16,9 @@ A_SOURCE = "harvey.io/source-cluster"
 A_REPROTECT = "harvey.io/needs-reprotect"
 A_BACKEND = "harvey.io/storage-backend"  # annotation on VMs: backend that replicates the disks
 A_PRIMARY_SINCE = "harvey.io/primary-since"  # annotation on VMs: when this site became primary (UTC ISO)
+L_GROUP = "harvey.io/recovery-group"     # label on VMs and standalone PVCs: recovery group membership (user-set)
+A_UNIT = "harvey.io/unit"                # annotation on VMs: the protection unit (group name, or the VM name)
+A_UNIT_CLAIMS = "harvey.io/unit-claims"  # annotation on VMs: JSON list of every PVC replicated with the unit
 
 # metadata that must not travel to the other cluster (backends add their own prefixes)
 DROP_ANN_PREFIXES = ("kubectl.kubernetes.io/", "kubevirt.io/latest-observed-api-version",
@@ -23,6 +26,7 @@ DROP_ANN_PREFIXES = ("kubectl.kubernetes.io/", "kubevirt.io/latest-observed-api-
                      "harvey.io/", "pv.kubernetes.io/", "volume.kubernetes.io/", "volume.beta.kubernetes.io/",
                      "harvesterhci.io/imageId", "cdi.kubevirt.io/")
 DROP_LABEL_PREFIXES = ("harvey.io/",)
+KEEP_LABELS = ("harvey.io/recovery-group",)   # travels to the other site with the object
 
 
 class ReplicationError(Exception):
@@ -51,7 +55,8 @@ def clean_meta(meta: dict, keep_annotations: bool = True, extra_drop: Iterable[s
     out = {"name": meta["name"]}
     if meta.get("namespace"):
         out["namespace"] = meta["namespace"]
-    labels = {k: v for k, v in (meta.get("labels") or {}).items() if not k.startswith(DROP_LABEL_PREFIXES)}
+    labels = {k: v for k, v in (meta.get("labels") or {}).items()
+              if k in KEEP_LABELS or not k.startswith(DROP_LABEL_PREFIXES)}
     if labels:
         out["labels"] = labels
     if keep_annotations:

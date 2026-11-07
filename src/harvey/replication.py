@@ -14,15 +14,17 @@ Who is primary is never stored locally: it is the harvey.io/role label on the VM
 from __future__ import annotations
 
 import copy
+import json
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .backends import REGISTRY, StorageBackend, backend_for_driver
-from .common import (A_BACKEND, A_PEER, A_PRIMARY_SINCE, A_REPROTECT, A_RUN, A_SOURCE, A_SYNCED, L_MANAGED, L_ROLE, L_VM,
+from .common import (A_BACKEND, A_PEER, A_PRIMARY_SINCE, A_UNIT, A_UNIT_CLAIMS, A_REPROTECT, A_RUN, A_SOURCE, A_SYNCED, L_MANAGED, L_ROLE, L_VM,
                      FailoverResult, ReplicationError, VolumeStatus, clean_meta, iso, now_utc)
 from .kube import KubeClient, KubeError
+from .units import Unit, resolve_unit
 
-__all__ = ["A_BACKEND", "A_PEER", "A_REPROTECT", "A_RUN", "L_MANAGED", "L_ROLE", "L_VM", "FailoverResult",
+__all__ = ["Unit", "A_BACKEND", "A_PEER", "A_REPROTECT", "A_RUN", "L_MANAGED", "L_ROLE", "L_VM", "FailoverResult",
            "ReplicationError", "Replicator", "VolumeStatus", "build_replica_vm", "original_run_strategy",
            "vm_claims", "vm_configmap_names", "vm_nads", "vm_secret_names", "vm_status"]
 
@@ -155,9 +157,24 @@ class Replicator:
         ann = (vm["metadata"].get("annotations") or {}).get(A_BACKEND)
         if ann:
             return self.backend(ann)
+        return self.detect_backend_claims(cluster, ns, vm_claims(vm), vm["metadata"]["name"])
+
+    def unit_backend(self, cluster: str, unit: Unit) -> StorageBackend:
+        """Backend of a unit: config override > recorded on a member VM > CSI drivers of all its PVCs."""
+        if self.settings.get("backend"):
+            return self.backend(self.settings["backend"])
+        for m in unit.vms:
+            v = self.k[cluster].get("vm", unit.ns, m)
+            ann = ((v or {}).get("metadata", {}).get("annotations") or {}).get(A_BACKEND)
+            if ann:
+                return self.backend(ann)
+        return self.detect_backend_claims(cluster, unit.ns, unit.claims, unit.describe())
+
+    def detect_backend_claims(self, cluster: str, ns: str, claims: List[str], what: str) -> StorageBackend:
+        vm = {"metadata": {"name": what}}
         k = self.k[cluster]
         found = set()
-        for c in vm_claims(vm):
+        for c in claims:
             pvc = k.get("pvc", ns, c)
             pv = k.get("pv", None, pvc["spec"]["volumeName"]) if pvc and pvc["spec"].get("volumeName") else None
             drv = ((pv or {}).get("spec", {}).get("csi") or {}).get("driver")
@@ -171,7 +188,7 @@ class Replicator:
             raise ReplicationError(f"{ns}/{vm['metadata']['name']} has no PVC volumes")
         if len(found) > 1:
             raise ReplicationError(f"{ns}/{vm['metadata']['name']} mixes storage backends {sorted(found)}; "
-                                   f"one VM must be replicated by one engine")
+                                   f"one VM (or recovery group) must be replicated by one engine")
         return self.backend(found.pop())
 
     def backend_of(self, ns: str, vm_name: str, *clusters: str) -> StorageBackend:
@@ -206,11 +223,12 @@ class Replicator:
 
     # ── metadata sync ────────────────────────────────────────────────────────
     def sync_metadata(self, ns: str, vm_name: str, src: str, dst: str, vm: Optional[dict] = None,
-                      backend: Optional[StorageBackend] = None) -> List[str]:
+                      backend: Optional[StorageBackend] = None, unit: Optional[Unit] = None) -> List[str]:
         """Copies VM spec + Secrets + ConfigMaps + NADs from src to dst. The dst VM always stays Halted."""
         ks, kd = self.k[src], self.k[dst]
         vm = vm or self._get_vm(src, ns, vm_name)
-        backend = backend or self.detect_backend(src, ns, vm)
+        unit = unit or self.unit(src, ns, vm_name)
+        backend = backend or self.unit_backend(src, unit)
         drop = backend.drop_annotation_prefixes
         actions = []
         kd.ensure_namespace(ns)
@@ -264,30 +282,50 @@ class Replicator:
         if cur is not None and vm_status(cur) not in ("Stopped", "Halted", "Unknown"):
             raise ReplicationError(f"replica {ns}/{vm_name} on {dst} is {vm_status(cur)}; it must be stopped")
         body = build_replica_vm(vm, src, src, backend=backend.name, extra_drop=drop)
+        body["metadata"]["annotations"].update(self._unit_ann(unit))
         actions.append(f"vm/{vm_name} {kd.apply('vm', ns, body)} (Halted)")
         return actions
 
+    # ── units ────────────────────────────────────────────────────────────────
+    def unit(self, cluster: str, ns: str, vm_name: Optional[str] = None, group: Optional[str] = None) -> Unit:
+        """The protection unit (recovery group, or the VM alone) as seen on `cluster`; enforces the shared-disk
+        guard."""
+        return resolve_unit(self.k[cluster], ns, vm_name=vm_name, group=group, cluster=cluster)
+
+    def _unit_ann(self, unit: Unit) -> dict:
+        return {A_UNIT: unit.name, A_UNIT_CLAIMS: json.dumps(unit.claims)}
+
     # ── protect ──────────────────────────────────────────────────────────────
-    def protect(self, ns: str, vm_name: str, src: str, dst: str, wait_init: bool = False) -> List[str]:
+    def protect(self, ns: str, vm_name: Optional[str], src: str, dst: str, wait_init: bool = False,
+                group: Optional[str] = None) -> List[str]:
+        """Protects the VM's unit: the VM alone, or its whole recovery group (all member VMs, their disks once,
+        and the group's standalone PVCs)."""
         kd = self.k[dst]
-        vm = self._get_vm(src, ns, vm_name)
-        cur_dst = kd.get("vm", ns, vm_name)
-        if cur_dst is not None and (cur_dst["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
-            raise ReplicationError(f"{ns}/{vm_name} is primary on {dst}; protect from {dst} instead")
-        claims = vm_claims(vm)
-        if not claims:
-            raise ReplicationError(f"{ns}/{vm_name} has no PVC volumes")
-        be = self.detect_backend(src, ns, vm)
+        unit = self.unit(src, ns, vm_name, group)
+        for m in unit.vms:
+            cur_dst = kd.get("vm", ns, m)
+            if cur_dst is not None and (cur_dst["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
+                raise ReplicationError(f"{ns}/{m} is primary on {dst}; protect from {dst} instead")
+        if not unit.claims:
+            raise ReplicationError(f"{unit.describe()} has no PVC volumes")
+        be = self.unit_backend(src, unit)
         out = [f"storage backend: {be.name} ({be.engine})"]
+        if unit.group:
+            line = f"recovery group {unit.group}: VMs {', '.join(unit.vms) or '-'}; {len(unit.claims)} volume(s)"
+            if unit.standalone:
+                line += f", standalone PVC(s): {', '.join(unit.standalone)}"
+            out.append(line)
         kd.ensure_namespace(ns)
-        out += be.protect(src, dst, ns, vm_name, claims, wait_init)
-        out += [f"{dst}: {a}" for a in self.sync_metadata(ns, vm_name, src, dst, vm=vm, backend=be)]
-        self._set_role(src, ns, vm_name, "primary", dst, {A_BACKEND: be.name})
+        out += be.protect(src, dst, ns, unit.name, unit.claims, wait_init)
+        for m in unit.vms:
+            vm = self._get_vm(src, ns, m)
+            out += [f"{dst}: {a}" for a in self.sync_metadata(ns, m, src, dst, vm=vm, backend=be, unit=unit)]
+            self._set_role(src, ns, m, "primary", dst, {A_BACKEND: be.name, **self._unit_ann(unit)})
         return out
 
     def wait_initialized(self, src: str, dst: str, ns: str, vm_name: str):
-        vm = self._get_vm(src, ns, vm_name)
-        self.detect_backend(src, ns, vm).wait_initialized(src, dst, ns, vm_name, vm_claims(vm))
+        unit = self.unit(src, ns, vm_name)
+        self.unit_backend(src, unit).wait_initialized(src, dst, ns, unit.name, unit.claims)
 
     # ── status ───────────────────────────────────────────────────────────────
     def protected_vms(self, namespace: Optional[str] = None) -> List[Tuple[str, str]]:
@@ -332,9 +370,30 @@ class Replicator:
         return None, None
 
     def volume_status(self, ns: str, vm_name: str, primary: str, replica: str) -> List[VolumeStatus]:
-        vm = self._get_vm(primary, ns, vm_name)
-        be = self.detect_backend(primary, ns, vm)
-        return be.volume_status(primary, replica, ns, vm_name, vm_claims(vm))
+        """Rows for every volume of the VM's unit (its recovery group's volumes, for a member)."""
+        unit = self.unit(primary, ns, vm_name)
+        return self.unit_backend(primary, unit).volume_status(primary, replica, ns, unit.name, unit.claims)
+
+    def expand_plan(self, plan: List[Tuple[str, str, int, int]], cluster: str) -> Tuple[list, List[str]]:
+        """Adds the missing members of every recovery group in the plan (a group fails over as a whole).
+        Returns (plan, notes). Raises if a VM shares a disk outside its group."""
+        have = {(ns, vm) for ns, vm, _, _ in plan}
+        out, notes = list(plan), []
+        for ns, vm, _, _ in plan:
+            unit = self.unit(cluster, ns, vm)
+            for m in unit.vms:
+                if (ns, m) in have:
+                    continue
+                v = self._get_vm(cluster, ns, m)
+                lab = v["metadata"].get("labels") or {}
+                try:
+                    prio, delay = int(lab.get("failover-priority", 0)), int(lab.get("failover-startup-time", 0))
+                except ValueError:
+                    prio, delay = 0, 0
+                out.append((ns, m, prio, delay))
+                have.add((ns, m))
+                notes.append(f"{ns}/{m} added: it is in recovery group {unit.group} with {vm}")
+        return out, notes
 
     # ── start / stop ─────────────────────────────────────────────────────────
     def stop_vm(self, cluster: str, ns: str, vm_name: str):
@@ -372,7 +431,8 @@ class Replicator:
     # ── failover ─────────────────────────────────────────────────────────────
     def failover(self, plan: List[Tuple[str, str, int, int]], src: str, dst: str, unplanned: bool = False,
                  force: bool = False, hooks_cb: Optional[Callable[[str], bool]] = None) -> FailoverResult:
-        """plan = [(namespace, vm, priority, startup_delay)]. Higher priority = stopped last, started first."""
+        """plan = [(namespace, vm, priority, startup_delay)]. Higher priority = stopped last, started first.
+        Storage is synced and promoted per unit (a recovery group as a whole), after all its VMs stopped."""
         res = FailoverResult()
         t_start = time.time()
         ks, kd = self.k[src], self.k[dst]
@@ -381,17 +441,24 @@ class Replicator:
 
         # ── preflight ──
         self.log("[bold]Preflight[/bold]")
-        claims_of: Dict[Tuple[str, str], List[str]] = {}
+        plan, notes = self.expand_plan(plan, dst)
+        for n in notes:
+            self.log(f"  [cyan]{n}[/cyan]")
+        units: Dict[Tuple[str, str], Unit] = {}
+        unit_of: Dict[Tuple[str, str], Tuple[str, str]] = {}
         be_of: Dict[Tuple[str, str], StorageBackend] = {}
         for ns, vm, _, _ in plan:
             dvm = self._get_vm(dst, ns, vm)
             if (dvm["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
                 raise ReplicationError(f"{ns}/{vm} is already primary on {dst}")
-            claims = vm_claims(dvm)
-            be = self.detect_backend(dst, ns, dvm)
-            be.preflight(src, dst, ns, vm, claims, src_up)
-            claims_of[(ns, vm)] = claims
-            be_of[(ns, vm)] = be
+            unit = self.unit(dst, ns, vm)
+            unit_of[(ns, vm)] = unit.key
+            if unit.key not in units:
+                units[unit.key] = unit
+                be = self.unit_backend(dst, unit)
+                be.preflight(src, dst, ns, unit.name, unit.claims, src_up)
+                be_of[unit.key] = be
+                self.log(f"  {unit.describe()}: {len(unit.claims)} volume(s) ready ({be.engine})")
             if src_up:
                 s = vm_status(ks.get("vm", ns, vm))
                 if unplanned and s == "Running" and not force:
@@ -400,16 +467,16 @@ class Replicator:
             elif not unplanned:
                 raise ReplicationError(f"{src} is unreachable: use --unplanned (accepts data loss up to the "
                                        f"replication lag)")
-            self.log(f"  {ns}/{vm}: {len(claims)} volume(s) ready ({be.engine})")
         if not hooks_cb("pre_failover"):
             raise ReplicationError("pre_failover hook aborted")
 
+        ok_units = set()
         if not unplanned:
             # ── metadata sync (catch spec changes made since the last sync) ──
             self.log("[bold]Metadata sync[/bold]")
             for ns, vm, _, _ in plan:
                 try:
-                    self.sync_metadata(ns, vm, src, dst, backend=be_of[(ns, vm)])
+                    self.sync_metadata(ns, vm, src, dst, backend=be_of[unit_of[(ns, vm)]])
                 except (ReplicationError, KubeError) as e:
                     self.log(f"  [yellow]{ns}/{vm}: metadata sync failed ({e}); using the last synced spec[/yellow]")
 
@@ -429,47 +496,53 @@ class Replicator:
                     self.log(f"  [red]✗ {ns}/{vm}: {e}[/red]")
             res.phases["stop"] = int(time.time() - t)
 
-            # ── final sync ──
+            # ── final sync: once per unit, only when ALL of its VMs stopped ──
             t = time.time()
             self.log("[bold]Final sync[/bold]")
-            for ns, vm, _, _ in plan:
-                if (ns, vm) not in stop_times:
+            for key, unit in units.items():
+                members = [(unit.ns, m) for m in unit.vms]
+                if not all(m in stop_times for m in members):
+                    res.failed.append((unit.describe(), "final-sync", "not every VM of the unit stopped"))
+                    self.log(f"  [red]✗ {unit.describe()}: not every VM stopped — NOT promoting it[/red]")
                     continue
+                last_stop = max([stop_times[m] for m in members] or [now_utc()])
                 try:
-                    for c, nbytes, secs in be_of[(ns, vm)].final_sync(src, dst, ns, vm, claims_of[(ns, vm)],
-                                                                      stop_times[(ns, vm)]):
-                        res.synced.append((f"{ns}/{vm}", c, nbytes, round(secs, 1)))
-                        self.log(f"  [green]✓[/green] {ns}/{c}: {nbytes} B in {secs:.1f}s")
-                    res.rpo[f"{ns}/{vm}"] = 0
+                    for c, nbytes, secs in be_of[key].final_sync(src, dst, unit.ns, unit.name, unit.claims,
+                                                                 last_stop):
+                        res.synced.append((unit.describe(), c, nbytes, round(secs, 1)))
+                        self.log(f"  [green]✓[/green] {unit.ns}/{c}: {nbytes} B in {secs:.1f}s")
+                    ok_units.add(key)
+                    for m in unit.vms:
+                        res.rpo[f"{unit.ns}/{m}"] = 0
                 except Exception as e:   # backend-specific errors (ONTAP, Stork, ...) must not abort the others
-                    res.failed.append((f"{ns}/{vm}", "final-sync", str(e)))
-                    self.log(f"  [red]✗ {ns}/{vm}: {e} — NOT promoting this VM[/red]")
-                    stop_times.pop((ns, vm))
+                    res.failed.append((unit.describe(), "final-sync", str(e)))
+                    self.log(f"  [red]✗ {unit.describe()}: {e} — NOT promoting it[/red]")
             res.phases["final_sync"] = int(time.time() - t)
-            eligible = [p for p in plan if (p[0], p[1]) in stop_times]
         else:
-            # data loss window = age of the newest replicated recovery point, per VM (worst volume)
-            eligible = list(plan)
-            for ns, vm, _, _ in plan:
+            # data loss window = age of the newest replicated recovery point, per unit (worst volume)
+            for key, unit in units.items():
+                ok_units.add(key)
                 try:
-                    res.rpo[f"{ns}/{vm}"] = be_of[(ns, vm)].recovery_point_age(src, dst, ns, vm,
-                                                                               claims_of[(ns, vm)], src_up)
+                    age = be_of[key].recovery_point_age(src, dst, unit.ns, unit.name, unit.claims, src_up)
                 except Exception:
-                    res.rpo[f"{ns}/{vm}"] = None
+                    age = None
+                for m in unit.vms:
+                    res.rpo[f"{unit.ns}/{m}"] = age
 
-        # ── promote ──
+        # ── promote: once per unit ──
         t = time.time()
         self.log("[bold]Promote on " + dst + "[/bold]")
-        promoted = []
-        for ns, vm, prio, delay in eligible:
+        promoted_units = set()
+        for key in [k for k in units if k in ok_units]:
+            unit = units[key]
             try:
-                be_of[(ns, vm)].promote(src, dst, ns, vm, claims_of[(ns, vm)], src_up, unplanned)
-                res.promoted.append(f"{ns}/{vm}")
-                promoted.append((ns, vm, prio, delay))
-                self.log(f"  [green]✓[/green] {ns}/{vm}: {len(claims_of[(ns, vm)])} volume(s) read-write")
+                be_of[key].promote(src, dst, unit.ns, unit.name, unit.claims, src_up, unplanned)
+                promoted_units.add(key)
+                res.promoted += [f"{unit.ns}/{m}" for m in unit.vms]
+                self.log(f"  [green]✓[/green] {unit.describe()}: {len(unit.claims)} volume(s) read-write")
             except Exception as e:
-                res.failed.append((f"{ns}/{vm}", "promote", str(e)))
-                self.log(f"  [red]✗ {ns}/{vm}: {e}[/red]")
+                res.failed.append((unit.describe(), "promote", str(e)))
+                self.log(f"  [red]✗ {unit.describe()}: {e}[/red]")
         res.phases["promote"] = int(time.time() - t)
         if not hooks_cb("pre_start"):
             raise ReplicationError("pre_start hook aborted (volumes are already promoted)")
@@ -477,10 +550,14 @@ class Replicator:
         # ── start ──
         t = time.time()
         self.log("[bold]Start on " + dst + "[/bold]")
-        for ns, vm, prio, delay in sorted(promoted, key=lambda x: x[2], reverse=True):
+        to_start = [p for p in plan if unit_of[(p[0], p[1])] in promoted_units]
+        for ns, vm, prio, delay in sorted(to_start, key=lambda x: x[2], reverse=True):
+            unit = units[unit_of[(ns, vm)]]
             try:
                 # the promoted side is the primary from now on, even if the VM is slow to boot
-                self._set_role(dst, ns, vm, "primary", src, {A_BACKEND: be_of[(ns, vm)].name})
+                ann = {A_BACKEND: be_of[unit.key].name}
+                ann.update(self._unit_ann(unit))
+                self._set_role(dst, ns, vm, "primary", src, ann)
                 if src_up:
                     try:
                         self._set_role(src, ns, vm, "replica", dst, {A_REPROTECT: "true"})
@@ -501,63 +578,75 @@ class Replicator:
         return res
 
     # ── reprotect ────────────────────────────────────────────────────────────
-    def reprotect(self, ns: str, vm_name: str, new_src: str, new_dst: str, wait_init: bool = False) -> List[str]:
-        """After a failover to new_src: make new_dst a replica of new_src again (reverse resync).
+    def reprotect(self, ns: str, vm_name: Optional[str], new_src: str, new_dst: str, wait_init: bool = False,
+                  group: Optional[str] = None) -> List[str]:
+        """After a failover to new_src: make new_dst a replica of new_src again, for the VM's whole unit.
         Overwrites new_dst's copy of the disks with new_src's."""
         kd = self.k[new_dst]
-        vm = self._get_vm(new_src, ns, vm_name)
-        if (vm["metadata"].get("labels") or {}).get(L_ROLE) != "primary":
-            raise ReplicationError(f"{ns}/{vm_name} is not primary on {new_src}")
-        dvm = self._get_vm(new_dst, ns, vm_name)
-        if vm_status(dvm) not in ("Stopped", "Halted"):
-            raise ReplicationError(f"{ns}/{vm_name} is {vm_status(dvm)} on {new_dst}; it must be stopped "
-                                   f"(its disks will be overwritten)")
-        dmd = dvm["metadata"]
-        if (dmd.get("labels") or {}).get(L_ROLE) == "primary":
-            mine = (vm["metadata"].get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
-            theirs = (dmd.get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
-            if not mine or mine <= theirs:
-                raise ReplicationError(f"both sites claim primary for {ns}/{vm_name} and {new_src} is not the "
-                                       f"newer one ({mine or '?'} vs {theirs or '?'}); resolve by hand")
-            # stale primary left behind by an unplanned failover: demote it before overwriting its disks
-            self._set_role(new_dst, ns, vm_name, "replica", new_src, {A_REPROTECT: "true"})
-        be = self.detect_backend(new_src, ns, vm)
-        out = []
-        if (dmd.get("labels") or {}).get(L_ROLE) == "primary":
-            out.append(f"{new_dst}: stale primary copy (unplanned failover) demoted to replica")
-        out += be.reprotect(new_src, new_dst, ns, vm_name, vm_claims(vm), wait_init)
-        out += [f"{new_dst}: {a}" for a in self.sync_metadata(ns, vm_name, new_src, new_dst, vm=vm, backend=be)]
-        kd.merge_patch("vm", ns, vm_name, {"metadata": {"annotations": {A_REPROTECT: None}}})
+        unit = self.unit(new_src, ns, vm_name, group)
+        out: List[str] = []
+        if unit.group:
+            out.append(f"recovery group {unit.group}: VMs {', '.join(unit.vms)}")
+        for m in unit.vms:
+            vm = self._get_vm(new_src, ns, m)
+            if (vm["metadata"].get("labels") or {}).get(L_ROLE) != "primary":
+                raise ReplicationError(f"{ns}/{m} is not primary on {new_src}")
+            dvm = self._get_vm(new_dst, ns, m)
+            if vm_status(dvm) not in ("Stopped", "Halted"):
+                raise ReplicationError(f"{ns}/{m} is {vm_status(dvm)} on {new_dst}; it must be stopped "
+                                       f"(its disks will be overwritten)")
+            dmd = dvm["metadata"]
+            if (dmd.get("labels") or {}).get(L_ROLE) == "primary":
+                mine = (vm["metadata"].get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
+                theirs = (dmd.get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
+                if not mine or mine <= theirs:
+                    raise ReplicationError(f"both sites claim primary for {ns}/{m} and {new_src} is not the "
+                                           f"newer one ({mine or '?'} vs {theirs or '?'}); resolve by hand")
+                # stale primary left behind by an unplanned failover: demote it before overwriting its disks
+                self._set_role(new_dst, ns, m, "replica", new_src, {A_REPROTECT: "true"})
+                out.append(f"{new_dst}: {m}: stale primary copy (unplanned failover) demoted to replica")
+        be = self.unit_backend(new_src, unit)
+        out += be.reprotect(new_src, new_dst, ns, unit.name, unit.claims, wait_init)
+        for m in unit.vms:
+            vm = self._get_vm(new_src, ns, m)
+            out += [f"{new_dst}: {a}" for a in self.sync_metadata(ns, m, new_src, new_dst, vm=vm, backend=be,
+                                                                  unit=unit)]
+            kd.merge_patch("vm", ns, m, {"metadata": {"annotations": {A_REPROTECT: None}}})
         return out
 
     # ── unprotect ────────────────────────────────────────────────────────────
-    def unprotect(self, ns: str, vm_name: str, primary: str, replica: str, delete_replica: bool) -> List[str]:
+    def unprotect(self, ns: str, vm_name: Optional[str], primary: str, replica: str, delete_replica: bool,
+                  group: Optional[str] = None) -> List[str]:
+        """Stops replication for the VM's whole unit (a recovery group can't be half protected)."""
         kp, kr = self.k[primary], self.k[replica]
-        vm = self._get_vm(primary, ns, vm_name)
-        be = self.detect_backend(primary, ns, vm)
-        claims = vm_claims(vm)
-        out = be.unprotect(primary, replica, ns, vm_name, claims)
+        unit = self.unit(primary, ns, vm_name, group)
+        be = self.unit_backend(primary, unit)
+        out = be.unprotect(primary, replica, ns, unit.name, unit.claims)
         if delete_replica:
-            rvm = kr.get("vm", ns, vm_name)
-            if rvm is not None:
-                if vm_status(rvm) not in ("Stopped", "Halted"):
-                    raise ReplicationError(f"replica {ns}/{vm_name} on {replica} is {vm_status(rvm)}; not deleting")
-                kr.delete("vm", ns, vm_name)
-                out.append(f"{replica}: vm/{vm_name} deleted")
+            for m in unit.vms:
+                rvm = kr.get("vm", ns, m)
+                if rvm is not None:
+                    if vm_status(rvm) not in ("Stopped", "Halted"):
+                        raise ReplicationError(f"replica {ns}/{m} on {replica} is {vm_status(rvm)}; not deleting")
+                    kr.delete("vm", ns, m)
+                    out.append(f"{replica}: vm/{m} deleted")
             deleter = getattr(be, "delete_replica_volumes", None)
             if deleter:
-                out += deleter(replica, ns, claims)
+                out += deleter(replica, ns, unit.claims)
             else:
-                for c in claims:
+                for c in unit.claims:
                     if kr.get("pvc", ns, c) is not None:
                         kr.delete("pvc", ns, c)
                         out.append(f"{replica}: pvc/{c} deleted")
-            for s in vm_secret_names(vm):
-                obj = kr.get("secret", ns, s)
-                if obj is not None and (obj["metadata"].get("labels") or {}).get(L_MANAGED) == "true":
-                    kr.delete("secret", ns, s)
-                    out.append(f"{replica}: secret/{s} deleted")
-        kp.merge_patch("vm", ns, vm_name, {"metadata": {
-            "labels": {L_MANAGED: None, L_VM: None, L_ROLE: None},
-            "annotations": {A_PEER: None, A_RUN: None, A_REPROTECT: None, A_BACKEND: None, A_PRIMARY_SINCE: None}}})
+            for m in unit.vms:
+                for s in vm_secret_names(self._get_vm(primary, ns, m)):
+                    obj = kr.get("secret", ns, s)
+                    if obj is not None and (obj["metadata"].get("labels") or {}).get(L_MANAGED) == "true":
+                        kr.delete("secret", ns, s)
+                        out.append(f"{replica}: secret/{s} deleted")
+        for m in unit.vms:
+            kp.merge_patch("vm", ns, m, {"metadata": {
+                "labels": {L_MANAGED: None, L_VM: None, L_ROLE: None},
+                "annotations": {A_PEER: None, A_RUN: None, A_REPROTECT: None, A_BACKEND: None,
+                                A_PRIMARY_SINCE: None, A_UNIT: None, A_UNIT_CLAIMS: None}}})
         return out

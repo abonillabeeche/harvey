@@ -135,6 +135,10 @@ so the disks can differ by a little.
 - **More VMs:** list them (`harvey protect app-01 app-02 db-01 -n production`), or use
   `harvey failover namespace production`, and order them with `failover-priority`.
 - **Different StorageClass names on site-b (NetApp):** `replication.storage_class_map: {netapp-iscsi: dr-iscsi}`.
+- **VMs that share a disk** (for example a cluster quorum disk): put them in one recovery group first,
+  `harvey group add app -n production app-01 app-02`. Harvey refuses to protect or fail over one of them
+  alone. See [Recovery groups](../README.md#recovery-groups-and-shared-disks).
+- **A volume no VM uses yet:** add it to a group with `--pvc` and it's replicated and promoted with the group.
 - **A disk Harvey can't replicate** (for example a scratch disk on another CSI driver): Harvey refuses to protect
   a VM whose disks span backends, so move that disk, or keep it out of the VM.
 - **Everything you can configure:** [docs/configuration.md](../docs/configuration.md).

@@ -18,6 +18,11 @@ Pluggable storage backends and Portworx async DR.
   failover = final backup + wait for its restore (RPO 0); promote = activate + PV/PVC from stored templates;
   reprotect = DR volume of the new primary. Works around synced Backup CRs with `backupBlockSize: -1` and
   Harvester's PVC-in-use webhook. V1 lab-tested between Longhorn 1.12.1 and 1.13.0. See docs/longhorn.md.
+- **Recovery groups**: `harvey group add/remove/list/show` (label `harvey.io/recovery-group` on VMs and standalone
+  PVCs); protect, failover, reprotect, failback and unprotect act on whole groups; a group's storage is synced and
+  promoted once, after all its VMs stopped; `failover group`; `--group` on protect/reprotect/unprotect
+- **Shared-disk guard**: any operation on a VM that shares a disk with a VM outside its group is refused, with
+  the `harvey group add` command to fix it
 - `harvey.io/primary-since`: after an unplanned failover the newer primary wins, the stale copy is shown in
   `replication status` / `health-check` and demoted by `reprotect` (only while stopped)
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
@@ -26,6 +31,7 @@ Pluggable storage backends and Portworx async DR.
 - NetApp logic moved to `backends/netapp.py` without behaviour changes; 0.2 configs (top-level
   `replication.policy` / `schedule`) still work
 - `health-check` and `replication status` ignore VMs protected towards a third cluster
+- Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
 
 ### Fixed
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and

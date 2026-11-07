@@ -124,7 +124,7 @@ def test_replica_vm_records_backend_and_drops_stork_annotations():
 def test_px_migration_spec_is_volume_only():
     s = migration_spec("demo", "vm1", "harvey-to-dr")
     assert s["includeResources"] is False and s["includeVolumes"] is True and s["startApplications"] is False
-    assert s["namespaces"] == ["demo"] and s["selectors"] == {L_VM: "vm1"}
+    assert s["namespaces"] == ["demo"] and s["selectors"] == {"harvey.io/protection-unit": "vm1"}
     assert s["ignoreOwnerReferencesCheck"] is True and s["purgeDeletedResources"] is False
 
 

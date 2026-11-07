@@ -51,6 +51,7 @@ A_STATIC_COPY = "stork.libopenstorage.org/static-copy"
 A_RECLAIM = "stork.libopenstorage.org/reclaimPolicy"
 A_PROMOTED = "harvey.io/promoted-at"
 L_VM_NS = "harvey.io/vm-namespace"
+L_UNIT = "harvey.io/protection-unit"     # Stork selector: the unit (recovery group, or the VM) a PVC belongs to
 BUSY = ("", "Pending", "InProgress")
 DONE_OK = ("Successful",)
 EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
@@ -101,7 +102,7 @@ def migration_spec(ns: str, vm: str, pair: str) -> dict:
     return {
         "clusterPair": pair,
         "namespaces": [ns],
-        "selectors": {L_VM: vm},
+        "selectors": {L_UNIT: vm},
         "includeResources": False,
         "includeVolumes": True,
         "startApplications": False,
@@ -170,13 +171,14 @@ class PortworxBackend(StorageBackend):
                 "metadata": {"name": self.policy_name, "labels": {L_MANAGED: "true"}},
                 "policy": {"interval": {"intervalMinutes": self.interval}}})
 
-    def label_volumes(self, cluster: str, ns: str, vm: str, claims: List[str]):
-        """Stork selects the VM's PVCs and PVs by label (PVs are filtered with the same selector)."""
+    def label_volumes(self, cluster: str, ns: str, unit: str, claims: List[str]):
+        """Stork selects the unit's PVCs and PVs by label (PVs are filtered with the same selector). One label
+        value per PVC: a disk shared by several VMs belongs to their recovery group, never to one VM."""
         k = self.k[cluster]
         for c in claims:
-            pvc = k.merge_patch("pvc", ns, c, {"metadata": {"labels": {L_VM: vm}}})
+            pvc = k.merge_patch("pvc", ns, c, {"metadata": {"labels": {L_UNIT: unit}}})
             if pvc["spec"].get("volumeName"):
-                k.merge_patch("pv", None, pvc["spec"]["volumeName"], {"metadata": {"labels": {L_VM: vm}}})
+                k.merge_patch("pv", None, pvc["spec"]["volumeName"], {"metadata": {"labels": {L_UNIT: unit}}})
 
     def set_activated(self, cluster: str, pns: str, sched: str, active: bool, suspend: Optional[bool] = None):
         """Stork's per-site 'application is active here' flag (status.applicationActivated, no status
@@ -278,7 +280,7 @@ class PortworxBackend(StorageBackend):
                 sch = k.get("migrationschedule", pns, sched)
                 pair = sch["spec"]["template"]["spec"]["clusterPair"]
                 ns = sch["spec"]["template"]["spec"]["namespaces"][0]
-                vm = sch["spec"]["template"]["spec"]["selectors"][L_VM]
+                vm = sch["spec"]["template"]["spec"]["selectors"][L_UNIT]
                 return self.run_migration(cluster, pns, pair, ns, vm, "initial")
             time.sleep(5)
         raise ReplicationError(f"{cluster}: no successful migration of {pns}/{sched} after "
@@ -328,7 +330,7 @@ class PortworxBackend(StorageBackend):
                                        f"refusing to overwrite it")
         out = []
         self.label_volumes(src, ns, vm, claims)
-        out.append(f"{src}: labelled {len(claims)} PVC(s)+PV(s) {L_VM}={vm}")
+        out.append(f"{src}: labelled {len(claims)} PVC(s)+PV(s) {L_UNIT}={vm}")
         self.ensure_policy(src)
         self.ensure_policy(dst)        # the DR-side copy of the schedule references it too
         out.append(f"{src}: migrationschedule {pns}/{sched} {self._create_schedule(src, pns, sched, pair, ns, vm)} "
@@ -344,7 +346,7 @@ class PortworxBackend(StorageBackend):
         missing = [c for c in claims if kd.get("pvc", ns, c) is None]
         if missing:
             raise ReplicationError(f"{dst}: migration finished but PVC(s) {missing} are missing — are their PVs "
-                                   f"labelled {L_VM}={vm} and Bound on {src}?")
+                                   f"labelled {L_UNIT}={vm} and Bound on {src}?")
         return out
 
     def wait_initialized(self, src: str, dst: str, ns: str, vm: str, claims: List[str]):

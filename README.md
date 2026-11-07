@@ -63,6 +63,7 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 - [Storage backends](#storage-backends)
 - [The DR lifecycle, in commands](#the-dr-lifecycle-in-commands)
 - [Priorities: who comes back first](#priorities-who-comes-back-first)
+- [Recovery groups and shared disks](#recovery-groups-and-shared-disks)
 - [Measured in the lab](#measured-in-the-lab)
 - [Safety rails](#safety-rails)
 - [Installation](#installation) · [Configuration](#configuration) ([full reference](docs/configuration.md)) · [Command reference](#command-reference)
@@ -291,6 +292,36 @@ relabeling VMs. In a plan, the group's `priority` and `startup_delay` override t
 
 ---
 
+## Recovery groups and shared disks
+
+Some VMs only make sense together: a Windows failover cluster whose nodes share a quorum disk, an application
+and its database, or a VM plus a volume that no VM mounts yet. Put them in a **recovery group**, and Harvey
+protects, fails over, reprotects and fails back the group as one unit:
+
+```bash
+harvey group add wsfc -n production node1 node2 --pvc archive   # two VMs + a standalone PVC
+harvey group show wsfc -n production                              # what the group replicates
+harvey protect -n production --group wsfc                         # or: harvey protect node1 -n production
+harvey failover group wsfc -n production                          # or name any member: failover vm node1
+```
+
+- **VMs that share a disk must be in one recovery group.** Harvey checks this for every operation and refuses,
+  naming the VMs and the exact `harvey group add` command, when a VM shares a disk with a VM outside its group.
+  Failing over one of them alone would put the shared disk into use at two sites (split brain), or break the
+  other VM's protection.
+- **One unit, once.** A shared disk is replicated once, and synced and promoted once, after **every** VM of the
+  group has stopped. With Portworx the whole group is one migration, so every disk shares one recovery point.
+- **Naming one member means the whole group.** `harvey failover vm node1` adds node2 and says so. Inside the
+  group, VMs still stop and start in `failover-priority` order.
+- **Standalone PVCs** (`--pvc`) are replicated and promoted with the group. At the DR site they're ready for
+  whatever attaches them.
+- Harvester itself only lets two VMs use one PVC when the volume is a **shareable RWX** volume, so a shared
+  disk is always deliberate. The group rule makes sure those VMs also move together.
+- A group lives in one namespace, and its VMs and PVCs must all be on one storage backend. Membership is the
+  label `harvey.io/recovery-group=<name>`, so you can set it with `kubectl`, GitOps or the Harvester UI too.
+
+---
+
 ## Measured in the lab
 
 All output in this README is from these runs, with cluster names shortened. Small Leap 16 VMs (5 GiB root disk cloned from an image plus a 1 GiB data disk). Inside each guest, a service
@@ -302,6 +333,7 @@ writes a UTC timestamp to every disk every 5 seconds, so any lost write shows up
 | Failback (planned failover back + reprotect) | RTO **75–95 s** (4 runs), RPO **0** | RTO **119 s**, RPO **0** | RTO **93 s**, RPO **0** |
 | Unplanned failover | loss 7 s (data disks) to 62 s (root); disks of one VM can differ | **3 s** to Running; all disks from one point in time | **31 s** to Running; reported ≤ 180 s, real loss 151–156 s |
 | Old site comes back after an unplanned failover | Harvey refuses to sync over the newer primary | Stork suspends the old schedule itself (fence) | activated DR volumes stop restoring; reprotect demotes the stale primary |
+| Recovery group (2 VMs + a standalone PVC) | — | — | planned failover RTO **151 s**, failback **144 s**, RPO **0**, all 3 disks synced and promoted together |
 
 Results depend on link speed, change rate and array load. Measure your own: `harvey audit` keeps RTO and RPO
 for every run.
@@ -421,6 +453,8 @@ variable and label is listed in the [configuration reference](docs/configuration
 | `harvey status A B` | VM state side by side |
 | `harvey audit [--limit N]` | The JSONL audit log, including RTO and RPO per failover |
 | `harvey plan new / edit / list / show / run` | Recovery plans (below) |
+| `harvey group add / remove / list / show` | Recovery groups: VMs and standalone PVCs handled as one unit |
+| `harvey failover group NAME -n NS` · `protect/reprotect/unprotect --group NAME` | The same commands, for a whole group |
 
 Every failover command takes `--dry-run` and `--yes`. Ordering comes from labels on the VirtualMachine:
 
@@ -521,12 +555,11 @@ backend against an in-memory fake Kubernetes API.
 
 ## Roadmap
 
-- [ ] **TODO: Recovery groups.** Make "an application" a first-class unit: a named set of VMs (for example the
-  label `harvey.io/recovery-group=billing`) that you protect, sync, fail over, reprotect and fail back with one
-  command. The group would report health and lag as a whole, and recovery plans would reference groups instead
-  of listing VMs. Where the storage allows it, all of a group's disks would share one recovery point: Portworx
-  can migrate the whole group in one Stork migration. Trident doesn't expose ONTAP consistency groups yet, so on
-  NetApp a group stays crash-consistent per volume until it does.
+- [x] **Recovery groups** (0.3): VMs and standalone PVCs protected and failed over as one unit, with the
+  shared-disk guard.
+- [ ] **Protect a whole namespace**: `harvey protect --all -n production` protects every VM in the namespace,
+  and failovers still run in `failover-priority` order (`harvey failover namespace` already orders by priority).
+- [ ] Recovery plans that reference groups instead of listing VMs, and group-level health/lag in `health-check`.
 - [ ] `plan run --test` that boots clones of the replica volumes (FlexClone on NetApp, snapshots on Portworx)
   in an isolated namespace, not just the VM spec.
 - [ ] `harvey bench`: repeatable failover/failback measurements (RTO per phase, RPO from an in-guest marker,
@@ -552,7 +585,7 @@ git tag v0.3.0 && git push origin v0.3.0
 
 | Version | Highlights |
 |---|---|
-| 0.3 | Pluggable storage backends; **Portworx async DR** (Stork volume-only migrations, fencing, RPO from the migration trigger time); **Longhorn DR volumes** (V1 lab-tested, V2 alpha); stale-primary handling after unplanned failovers; health-check scoped to the cluster pair |
+| 0.3 | Pluggable storage backends; **Portworx async DR** (Stork volume-only migrations, fencing, RPO from the migration trigger time); **Longhorn DR volumes** (V1 lab-tested, V2 alpha); **recovery groups** with the shared-disk guard; stale-primary handling after unplanned failovers; health-check scoped to the cluster pair |
 | 0.2 | Storage-aware DR with NetApp SnapMirror via Trident: protect, replication status with lag, metadata sync, planned (lossless) and unplanned failover, reprotect, failback; kubeconfig or Rancher access; ONTAP credential discovery |
 | 0.1 | Stop/start failover, priorities and startup delays, recovery plans with hooks, DR test mode, RTO tracking, audit log, health-check |
 

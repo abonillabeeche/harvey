@@ -130,6 +130,12 @@ references, even a stopped one. So during reprotect Harvey deletes the **stopped
 primary (orphan propagation, nothing else goes with it), deletes the CDI DataVolume that owns the root PVC (if
 any), then the PVCs. Harvey recreates the VM from the new primary right after. It refuses if that VM is running.
 
+### A new volume's BackupVolume can sync after its Backup
+
+Longhorn's webhook also needs the synced Backup CR's labels and the BackupVolume CR on the DR cluster. For a
+brand-new volume, the BackupVolume can show up after the Backup, so Harvey waits for all three before it creates
+the DR volume.
+
 ### Synced backups report an unknown block size
 
 A Backup CR that a cluster learns about through the backup target sync has `spec.backupBlockSize: -1`. This was
@@ -169,6 +175,7 @@ timestamps were written to both disks every 5 seconds.
 | failback (planned failover back + reprotect) | **RTO 93 s, RPO 0**. Guest history across both moves: only the two outage gaps |
 | unplanned failover (source unreachable) | **31 s** to Running. Reported RPO ≤ 180 s; real loss 151–156 s. The two disks were a few seconds apart |
 | reprotect after the unplanned failover | the stale primary was demoted, disks replaced, replication running again |
+| recovery group: 2 VMs + 1 standalone PVC | protect, planned failover naming one member (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
 
 ## RPO and RTO
 

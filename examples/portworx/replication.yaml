@@ -1,8 +1,8 @@
 # REFERENCE ONLY: what `harvey protect app-01 -n production` creates with the portworx backend.
 # You don't apply this; it shows what makes the three volumes replicate site-a -> site-b.
 #
-# Portworx replicates per VM, not per disk: ONE Stork MigrationSchedule moves all three PVCs together, so they
-# share one recovery point. Harvey selects them with a label it puts on the PVCs (and their PVs).
+# Portworx replicates per unit (the VM, or its recovery group), not per disk: ONE Stork MigrationSchedule moves all
+# three PVCs together, so they share one recovery point. Harvey selects them with a label on the PVCs and PVs.
 
 # ── site-a: the VM's PVCs get the selector label (shown for one; same on app-01-data and app-01-logs)
 apiVersion: v1
@@ -11,7 +11,7 @@ metadata:
   name: app-01-root
   namespace: production
   labels:
-    harvey.io/vm: app-01                      # <- Stork selects the PVCs (and their PVs) by this
+    harvey.io/protection-unit: app-01         # <- Stork selects the PVCs (and their PVs) by this
 ---
 # ── site-a: the interval policy (cluster-scoped; replication.portworx.interval_minutes)
 apiVersion: stork.libopenstorage.org/v1alpha1
@@ -35,7 +35,7 @@ spec:
     spec:
       clusterPair: harvey-to-site-b           # replication.portworx.pairs["site-a->site-b"]
       namespaces: [production]
-      selectors: {harvey.io/vm: app-01}       # -> app-01-root, app-01-data, app-01-logs
+      selectors: {harvey.io/protection-unit: app-01}   # -> app-01-root, app-01-data, app-01-logs
       includeResources: false                 # volume-only: Stork moves PV + PVC + data; Harvey moves the VM
       includeVolumes: true
       startApplications: false

@@ -208,7 +208,11 @@ class LonghornBackend(StorageBackend):
                     pass
                 last_sync = time.time()
             b = k.get("lhbackup", NS, backup)
-            if b is not None:
+            labels = ((b or {}).get("metadata") or {}).get("labels") or {}
+            # the mutator also needs the synced Backup CR's target/volume labels and the BackupVolume CR; a brand-new
+            # volume's BackupVolume can show up after its Backup
+            if b is not None and labels.get("backup-target") and labels.get("backup-volume") and \
+                    self._backup_volume(dst, volume) is not None:
                 cur = str((b.get("spec") or {}).get("backupBlockSize") or "")
                 if cur not in ("2097152", "16777216"):
                     k.merge_patch("lhbackup", NS, backup, {"spec": {"backupBlockSize": str(block_size or 2097152)}})
@@ -229,7 +233,7 @@ class LonghornBackend(StorageBackend):
                                                           "storageClassName", "persistentVolumeReclaimPolicy",
                                                           "mountOptions") if key in pv["spec"]}}
         pvc_t = {"labels": {k2: v for k2, v in (pvc["metadata"].get("labels") or {}).items()
-                            if not k2.startswith("harvey.io/")},
+                            if k2 == "harvey.io/recovery-group" or not k2.startswith("harvey.io/")},
                  "annotations": {k2: v for k2, v in (pvc["metadata"].get("annotations") or {}).items()
                                  if k2.startswith(("harvesterhci.io/owned-by", "field.cattle.io/"))},
                  "spec": {key: pvc["spec"][key] for key in ("accessModes", "volumeMode", "resources",
@@ -270,21 +274,26 @@ class LonghornBackend(StorageBackend):
                 body["spec"][key] = s[key]
         kd.create("lhvolume", NS, body)
 
-    def _release_replica_vm(self, cluster: str, ns: str, vm: str, out: List[str]):
+    def _release_vms_using(self, cluster: str, ns: str, claim: str, out: List[str]):
         """Harvester refuses to delete a PVC that a VM references, even a stopped one. Before replacing the old
-        primary's disks, delete its (stopped) VM object; the orchestrator recreates it from the new primary right
-        after. Orphan propagation: nothing else is deleted with it."""
+        primary's disk, delete every (stopped) VM object that uses it (one VM, or several for a shared disk in a
+        recovery group); the orchestrator recreates them from the new primary right after. Orphan propagation:
+        nothing else is deleted with them."""
         k = self.k[cluster]
-        cur = k.get("vm", ns, vm)
-        if cur is None:
-            return
-        status = (cur.get("status") or {}).get("printableStatus")
-        if status not in ("Stopped", "Halted"):
-            raise ReplicationError(f"{cluster}: VM {ns}/{vm} is {status}; it must be stopped before its disks are "
-                                   f"replaced")
-        k.delete("vm", ns, vm, propagation="Orphan")
-        k.wait_for(lambda: k.get("vm", ns, vm) is None, self.timeouts["tmr"], what=f"VM {ns}/{vm} removal")
-        out.append(f"{cluster}: vm/{vm} removed (stopped replica; recreated from the new primary below)")
+        for v in k.list("vm", ns):
+            vols = v["spec"]["template"]["spec"].get("volumes", [])
+            uses = any((x.get("persistentVolumeClaim") or {}).get("claimName") == claim or
+                       (x.get("dataVolume") or {}).get("name") == claim for x in vols)
+            if not uses:
+                continue
+            name = v["metadata"]["name"]
+            status = (v.get("status") or {}).get("printableStatus")
+            if status not in ("Stopped", "Halted"):
+                raise ReplicationError(f"{cluster}: VM {ns}/{name} is {status}; it must be stopped before disk "
+                                       f"{claim} is replaced")
+            k.delete("vm", ns, name, propagation="Orphan")
+            k.wait_for(lambda: k.get("vm", ns, name) is None, self.timeouts["tmr"], what=f"VM {ns}/{name} removal")
+            out.append(f"{cluster}: vm/{name} removed (stopped replica; recreated from the new primary below)")
 
     def _delete_volume(self, cluster: str, ns: str, claim: str, volume: str) -> List[str]:
         """Delete PVC, PV and Longhorn volume of a claim (used on the replica side)."""
@@ -491,7 +500,7 @@ class LonghornBackend(StorageBackend):
             old = self._volume_name(new_dst, ns, c) if kd.get("pvc", ns, c) else (
                 v if kd.get("lhvolume", NS, v) else None)
             if old:
-                self._release_replica_vm(new_dst, ns, vm, out)
+                self._release_vms_using(new_dst, ns, c, out)
                 self._unschedule_backups(new_dst, old)
                 out += self._delete_volume(new_dst, ns, c, old)
             self.wait_backup_visible(new_dst, v, b["metadata"]["name"], (b.get("spec") or {}).get("backupBlockSize"))

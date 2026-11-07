@@ -145,12 +145,13 @@ See [longhorn.md](longhorn.md) for the BackupTarget setup and what Harvey change
 
 Global flag: `harvey --debug <command>` prints every API request.
 
-## Labels you set on VMs
+## Labels you set on VMs and PVCs
 
-| Label | Default | Meaning |
-|---|---|---|
-| `failover-priority` | `0` | higher = stopped last, started first |
-| `failover-startup-time` | `0` | seconds to wait after starting this VM before starting the next one |
+| Label | On | Default | Meaning |
+|---|---|---|---|
+| `failover-priority` | VM | `0` | higher = stopped last, started first |
+| `failover-startup-time` | VM | `0` | seconds to wait after starting this VM before starting the next one |
+| `harvey.io/recovery-group` | VM, PVC | none | recovery group membership (`harvey group add` sets it). **Required for VMs that share a disk.** On a PVC that no VM uses, it makes the PVC part of the group. It's copied to the replica site |
 
 Inside a recovery plan, the group's `priority` and `startup_delay` take precedence over these labels.
 
@@ -189,7 +190,9 @@ So that you can find, audit or clean up everything Harvey manages:
 | VMs | annotation `harvey.io/primary-since` | when this site became primary (resolves stale primaries) |
 | VMs | annotation `harvey.io/needs-reprotect` | set on the old primary after a failover |
 | VMs | annotation `harvey.io/synced-at` | last metadata sync |
-| Portworx | `SchedulePolicy harvey-<N>min`, `MigrationSchedule harvey-<vm>`, `Migration harvey-<vm>-final-*` | see [portworx.md](portworx.md) |
+| VMs | annotations `harvey.io/unit`, `harvey.io/unit-claims` | the protection unit (group or VM) and every PVC replicated with it; lets the DR site resolve a group without the source |
+| Portworx | `SchedulePolicy harvey-<N>min`, `MigrationSchedule harvey-<unit>`, `Migration harvey-<unit>-final-*` | `<unit>` = the group, or the VM; see [portworx.md](portworx.md) |
+| Portworx PVCs and PVs | label `harvey.io/protection-unit=<unit>` | the Stork selector |
 | Portworx PVCs | annotation `harvey.io/promoted-at` | failover time |
 | NetApp | `TridentMirrorRelationship <pvc>` on both sides | see [netapp.md](netapp.md) |
 | Longhorn | `RecurringJob harvey-backup-<N>m`, label `recurring-job-group.longhorn.io/harvey-dr`, snapshots `harvey-*`, backups labelled `harvey.io/backup-kind` | see [longhorn.md](longhorn.md) |

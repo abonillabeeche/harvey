@@ -39,10 +39,10 @@ namespace, and both directions must use the same namespace.
 
 | Object | Where | Purpose |
 |---|---|---|
-| label `harvey.io/vm=<vm>` | the VM's PVCs and PVs (source) | Stork selector |
+| label `harvey.io/protection-unit=<unit>` | the unit's PVCs and PVs (source) | Stork selector. `<unit>` = the recovery group, or the VM |
 | `SchedulePolicy harvey-<N>min` | both clusters | migration interval (`interval_minutes`, default 15) |
-| `MigrationSchedule harvey-<vm>` | source, pair namespace | volume-only migration (`includeResources: false`), `autoSuspend: true` |
-| `Migration harvey-<vm>-final-*` | source | final sync of a planned failover |
+| `MigrationSchedule harvey-<unit>` | source, pair namespace | volume-only migration (`includeResources: false`), `autoSuspend: true`. One per recovery group: all of the group's disks share one recovery point |
+| `Migration harvey-<unit>-final-*` | source | final sync of a planned failover |
 | annotation `harvey.io/promoted-at` | destination PVCs | marks the failover |
 
 Stork copies each MigrationSchedule to the destination as a suspended "static copy". On failover, Harvey sets
