@@ -16,6 +16,7 @@ Pick the folder for your storage. Each one has the same four steps:
 | `vm.yaml` | namespace, cloud-init Secret, the VM | **source** cluster only |
 | `config.yaml` | Harvey config (`~/.config/harvey/config.yaml`) | where you run Harvey |
 | `clusterpairs.sh` | Portworx only: one-time ClusterPairs | where you run `storkctl` |
+| `replication.yaml` | **reference only**: the per-volume replication objects `harvey protect` creates | don't apply |
 
 The two clusters are called `site-a` (where app-01 runs) and `site-b` (DR). Replace the kubeconfig paths, image URL
 and credentials with yours.
@@ -60,6 +61,33 @@ Harvey finds all three disks from the VM spec. You never list volumes. Per backe
 | NetApp | a `TridentMirrorRelationship` on each side and a mirrored PVC on site-b; waits for the SnapMirror baseline | copies the Secret, creates app-01 on site-b (Halted) |
 | Portworx | one `MigrationSchedule` for **all three** disks together; waits for the first migration (PV + PVC appear on site-b) | the same |
 | Longhorn | scheduled backups, a first backup, a standby DR volume on site-b; waits for its first restore | the same (the PVCs on site-b are created at failover) |
+
+### What makes each volume replicate
+
+You don't configure replication per volume. `harvey protect` reads the VM's disks and creates the storage
+objects for each one. `replication.yaml` in each folder shows exactly what it creates for app-01's three disks:
+
+| Backend | Created per disk | Created per VM |
+|---|---|---|
+| NetApp | a `TridentMirrorRelationship` on site-a (`promoted`) and on site-b (`established`, with the source volume handle, policy and schedule), plus the mirrored PVC on site-b. One ONTAP SnapMirror relationship per disk | — |
+| Portworx | the label `harvey.io/vm=app-01` on the PVC and PV | one Stork `MigrationSchedule` that selects the three PVCs by that label and moves them together |
+| Longhorn | on site-a the volume joins the backup group and points at the shared target; on site-b a standby DR volume | one `RecurringJob` (shared by all protected volumes) |
+
+The settings that shape those objects (policy, schedule, interval, pair names, backup target, retention, replica
+count) come from `config.yaml`, not from the VM. To look at them on a live system:
+
+```bash
+# NetApp
+kubectl -n production get tridentmirrorrelationships                 # 3 per site, one per disk
+# Portworx
+kubectl -n production get migrationschedules,migrations               # site-a
+kubectl -n production get pvc -l harvey.io/vm=app-01                  # the 3 PVCs it selects
+# Longhorn
+kubectl -n longhorn-system get recurringjobs harvey-backup-5m
+kubectl -n longhorn-system get volumes.longhorn.io -l harvey.io/vm=app-01   # site-b: 3 standby DR volumes
+```
+
+`harvey unprotect app-01 -n production` removes the replication objects again.
 
 Check it:
 

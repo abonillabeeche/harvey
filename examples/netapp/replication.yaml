@@ -1,0 +1,67 @@
+# REFERENCE ONLY: what `harvey protect app-01 -n production` creates for the three disks with the netapp backend.
+# You don't apply this; it shows what makes each volume replicate site-a -> site-b (and what to look at with kubectl).
+#
+# Per PVC Harvey creates one TridentMirrorRelationship (TMR) on each side, plus the mirrored PVC on site-b.
+# Trident turns that into one ONTAP SnapMirror relationship per volume (svm_a:vol -> svm_b:vol).
+
+# ── site-a (source): one TMR per PVC, state "promoted" = this side is read-write; exposes the ONTAP volume handle
+apiVersion: trident.netapp.io/v1
+kind: TridentMirrorRelationship
+metadata:
+  name: app-01-root
+  namespace: production
+  labels: {harvey.io/managed: "true", harvey.io/vm: app-01}
+spec:
+  state: promoted
+  volumeMappings:
+    - localPVCName: app-01-root
+# status.conditions[0].localVolumeHandle -> e.g. "svm_a:trident_pvc_3f1c..." (Harvey reads it for site-b)
+---
+apiVersion: trident.netapp.io/v1
+kind: TridentMirrorRelationship
+metadata: {name: app-01-data, namespace: production, labels: {harvey.io/managed: "true", harvey.io/vm: app-01}}
+spec:
+  state: promoted
+  volumeMappings: [{localPVCName: app-01-data}]
+---
+apiVersion: trident.netapp.io/v1
+kind: TridentMirrorRelationship
+metadata: {name: app-01-logs, namespace: production, labels: {harvey.io/managed: "true", harvey.io/vm: app-01}}
+spec:
+  state: promoted
+  volumeMappings: [{localPVCName: app-01-logs}]
+
+# ── site-b (DR): one TMR per PVC, state "established" = SnapMirror destination, pointing at the source handle
+---
+apiVersion: trident.netapp.io/v1
+kind: TridentMirrorRelationship
+metadata: {name: app-01-root, namespace: production, labels: {harvey.io/managed: "true", harvey.io/vm: app-01}}
+spec:
+  state: established
+  replicationPolicy: MirrorAllSnapshots       # replication.netapp.policy
+  replicationSchedule: 5min                   # replication.netapp.schedule
+  volumeMappings:
+    - localPVCName: app-01-root
+      remoteVolumeHandle: "svm_a:trident_pvc_3f1c..."   # from the site-a TMR status
+---
+# ...and the PVC it fills: same name, size and mode as on site-a, plus the mirror annotation.
+# Trident provisions it as a DP (data protection) volume on the peered SVM.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-01-root
+  namespace: production
+  labels: {harvey.io/managed: "true", harvey.io/vm: app-01}
+  annotations:
+    trident.netapp.io/mirrorRelationship: app-01-root
+spec:
+  accessModes: [ReadWriteMany]
+  volumeMode: Block
+  resources: {requests: {storage: 20Gi}}
+  storageClassName: netapp-iscsi             # or the replication.storage_class_map target
+---
+# app-01-data: same pattern (TMR established + PVC, netapp-iscsi, 50Gi, Block)
+# app-01-logs: same pattern (TMR established + PVC, netapp-nfs, 10Gi, Filesystem) -> an NFS SnapMirror relationship
+#
+# Failover flips the site-b TMRs to "promoted" (SnapMirror break, volumes become read-write).
+# Reprotect sets the site-a TMRs to "reestablished" with remoteVolumeHandle = the site-b volume (reverse resync).

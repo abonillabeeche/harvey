@@ -1,0 +1,48 @@
+# REFERENCE ONLY: what `harvey protect app-01 -n production` creates with the portworx backend.
+# You don't apply this; it shows what makes the three volumes replicate site-a -> site-b.
+#
+# Portworx replicates per VM, not per disk: ONE Stork MigrationSchedule moves all three PVCs together, so they
+# share one recovery point. Harvey selects them with a label it puts on the PVCs (and their PVs).
+
+# ── site-a: the VM's PVCs get the selector label (shown for one; same on app-01-data and app-01-logs)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-01-root
+  namespace: production
+  labels:
+    harvey.io/vm: app-01                      # <- Stork selects the PVCs (and their PVs) by this
+---
+# ── site-a: the interval policy (cluster-scoped; replication.portworx.interval_minutes)
+apiVersion: stork.libopenstorage.org/v1alpha1
+kind: SchedulePolicy
+metadata: {name: harvey-15min, labels: {harvey.io/managed: "true"}}
+policy:
+  interval: {intervalMinutes: 15}
+---
+# ── site-a: the schedule that replicates the three disks (volume-only: data + PV/PVC objects, nothing else)
+apiVersion: stork.libopenstorage.org/v1alpha1
+kind: MigrationSchedule
+metadata:
+  name: harvey-app-01
+  namespace: production                       # same namespace as the ClusterPair
+  labels: {harvey.io/managed: "true", harvey.io/vm: app-01, harvey.io/vm-namespace: production}
+spec:
+  schedulePolicyName: harvey-15min
+  suspend: false
+  autoSuspend: true                           # a returning old primary suspends itself (fencing)
+  template:
+    spec:
+      clusterPair: harvey-to-site-b           # replication.portworx.pairs["site-a->site-b"]
+      namespaces: [production]
+      selectors: {harvey.io/vm: app-01}       # -> app-01-root, app-01-data, app-01-logs
+      includeResources: false                 # volume-only: Stork moves PV + PVC + data; Harvey moves the VM
+      includeVolumes: true
+      startApplications: false
+      purgeDeletedResources: false
+      ignoreOwnerReferencesCheck: true        # CDI DataVolume-owned root disks
+# Stork copies this schedule to site-b as a suspended "static copy". Each run creates a Migration
+# (harvey-app-01-interval-<time>) and, on site-b, the three PVs + PVCs (annotation stork.libopenstorage.org/migrated).
+#
+# Planned failover: suspend, one more Migration (harvey-app-01-final-<time>) after the VM stops, then
+# status.applicationActivated=true on the site-b copy (fence) and start the VM.

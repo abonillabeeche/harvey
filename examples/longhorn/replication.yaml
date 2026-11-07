@@ -1,0 +1,59 @@
+# REFERENCE ONLY: what `harvey protect app-01 -n production` creates with the longhorn backend.
+# You don't apply this; it shows what makes each of the three volumes replicate site-a -> site-b.
+#
+# Longhorn DR is backup based: each disk is backed up to the shared BackupTarget, and site-b keeps a standby
+# "DR volume" per disk that restores every new backup incrementally. All objects live in longhorn-system.
+
+# ── site-a: one RecurringJob for all protected volumes (replication.longhorn.interval_minutes / retain)
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata: {name: harvey-backup-5m, namespace: longhorn-system, labels: {harvey.io/managed: "true"}}
+spec:
+  name: harvey-backup-5m
+  task: backup
+  cron: "*/5 * * * *"
+  retain: 12
+  concurrency: 2
+  groups: [harvey-dr]
+---
+# ── site-a: each of the three Longhorn volumes (named after its PV) joins the group and backs up to the shared target.
+# Harvey only patches these two fields; shown for app-01-root's volume.
+apiVersion: longhorn.io/v1beta2
+kind: Volume
+metadata:
+  name: pvc-3f1c0000-0000-0000-0000-000000000001          # = the PV name / volumeHandle of app-01-root
+  namespace: longhorn-system
+  labels:
+    recurring-job-group.longhorn.io/harvey-dr: enabled     # <- scheduled backups
+spec:
+  backupTargetName: harvey                                 # <- replication.longhorn.backup_target
+---
+# ── site-b: one standby DR volume per disk, same name as the source volume, restoring from the backups
+apiVersion: longhorn.io/v1beta2
+kind: Volume
+metadata:
+  name: pvc-3f1c0000-0000-0000-0000-000000000001
+  namespace: longhorn-system
+  labels:
+    harvey.io/managed: "true"
+    harvey.io/vm: app-01
+    harvey.io/vm-claim: production.app-01-root
+    longhorn.io/backup-volume: pvc-3f1c0000-0000-0000-0000-000000000001
+  annotations:
+    harvey.io/pv-template: '{...}'                         # the PV and PVC Harvey creates at failover
+    harvey.io/pvc-template: '{...}'                        # (Longhorn forbids them on a standby volume)
+spec:
+  Standby: true                                            # DR volume: keeps restoring new backups
+  fromBackup: "s3://harvey-dr@us-east-1/?backup=backup-1a2b3c4d5e6f7a8b&volume=pvc-3f1c0000-0000-0000-0000-000000000001"
+  frontend: ""
+  size: "21474836480"                                      # copied from the source volume
+  numberOfReplicas: 3                                      # replication.longhorn.replicas, or the source's
+  dataEngine: v1                                           # v2 works the same way (alpha)
+  accessMode: rwx
+  migratable: true
+  backupTargetName: harvey
+  backupBlockSize: "2097152"
+# app-01-data and app-01-logs: the same pair (source volume patched + DR volume on site-b).
+#
+# Planned failover: snapshot + backup of each stopped volume, wait until each DR volume restored exactly that
+# backup, then Standby=false (activate) and create the PV + PVC from the templates, then start the VM.
