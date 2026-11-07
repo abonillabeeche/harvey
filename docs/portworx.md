@@ -62,6 +62,23 @@ volumes.
 - **unprotect --delete-replica**: restores the PV reclaim policy that Stork saved, so the Portworx volume is
   deleted together with the replica PVC.
 
+## Stork behaviour to know about (seen with Stork 26.4.2)
+
+- **The reverse migration is a full copy.** Portworx restores into a NEW volume on the old primary, with a new
+  volume ID and the same name. The old volume is deleted, so no space leaks, but reprotect moves the whole
+  volume again. Later migrations in the new direction are incremental. Every failover + reprotect cycle
+  re-sends each protected VM's full disks once, so size the object store traffic and the reprotect time for that.
+- **Stork reports a byte count only for full copies.** Incremental migrations (scheduled ones and the final
+  sync) show `bytesTotal: 0` even when they carried data, so Harvey's "0 B" lines for them are expected.
+- **Stork deletes the replica VM during reprotect.** Before it applies the PV/PVC objects, Stork's KubeVirt
+  failback cleanup finds that the existing PVs on the old primary point at the old volume ID ("volume handle
+  mismatch"). It deletes those PV/PVCs and any VirtualMachine that uses them (orphan policy), because it
+  expects `includeResources` to bring the VM back. Harvey runs a volume-only migration and re-syncs the VM
+  spec right after the storage step, so the replica VM is recreated (Halted). Don't run Stork migrations for
+  these namespaces outside Harvey.
+- **The first migration starts as soon as the MigrationSchedule exists.** `status.items` stays `null` until
+  then.
+
 ## Limits
 
 - The recovery point is per migration (all of the VM's volumes in one Stork migration), not crash-consistent
