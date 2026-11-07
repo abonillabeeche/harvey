@@ -1,0 +1,63 @@
+# app-01: one VM, three disks: root (from an image) + data + logs.
+# Harvester creates the PVCs from the volumeClaimTemplates annotation, as its UI does.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-01-cloudinit
+  namespace: production
+stringData:
+  userdata: |
+    #cloud-config
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... you@example.com
+    runcmd:
+      - [sh, -c, "mkdir -p /data /logs; blkid /dev/vdb || mkfs.ext4 -q /dev/vdb; blkid /dev/vdc || mkfs.ext4 -q /dev/vdc"]
+      - [sh, -c, "grep -q /data /etc/fstab || printf '/dev/vdb /data ext4 defaults,nofail 0 2\\n/dev/vdc /logs ext4 defaults,nofail 0 2\\n' >> /etc/fstab; mount -a"]
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: app-01
+  namespace: production
+  labels:
+    failover-priority: "50"          # ordering during failover (optional)
+    failover-startup-time: "30"
+  annotations:
+    harvesterhci.io/volumeClaimTemplates: '[
+      {"metadata":{"name":"app-01-root","annotations":{"harvesterhci.io/imageId":"production/leap16"}},
+       "spec":{"accessModes":["ReadWriteMany"],"volumeMode":"Block","resources":{"requests":{"storage":"20Gi"}},"storageClassName":"netapp-iscsi"}},
+      {"metadata":{"name":"app-01-data"},
+       "spec":{"accessModes":["ReadWriteMany"],"volumeMode":"Block","resources":{"requests":{"storage":"50Gi"}},"storageClassName":"netapp-iscsi"}},
+      {"metadata":{"name":"app-01-logs"},
+       "spec":{"accessModes":["ReadWriteMany"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"10Gi"}},"storageClassName":"netapp-nfs"}}]'
+spec:
+  runStrategy: RerunOnFailure
+  template:
+    metadata:
+      labels: {harvesterhci.io/vmName: app-01}
+    spec:
+      evictionStrategy: LiveMigrateIfPossible
+      domain:
+        cpu: {cores: 2}
+        memory: {guest: 3996Mi}
+        resources: {limits: {cpu: "2", memory: 4Gi}}
+        devices:
+          disks:
+            - {name: root, bootOrder: 1, disk: {bus: virtio}}
+            - {name: data, disk: {bus: virtio}}
+            - {name: logs, disk: {bus: virtio}}
+            - {name: cloudinit, disk: {bus: virtio}}
+          interfaces:
+            - {name: default, model: virtio, masquerade: {}}
+      networks:
+        - {name: default, pod: {}}
+      volumes:
+        - {name: root, persistentVolumeClaim: {claimName: app-01-root}}
+        - {name: data, persistentVolumeClaim: {claimName: app-01-data}}
+        - {name: logs, persistentVolumeClaim: {claimName: app-01-logs}}
+        - {name: cloudinit, cloudInitNoCloud: {secretRef: {name: app-01-cloudinit}}}

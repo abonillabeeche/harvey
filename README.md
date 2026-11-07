@@ -66,6 +66,7 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 - [Measured in the lab](#measured-in-the-lab)
 - [Safety rails](#safety-rails)
 - [Installation](#installation) · [Configuration](#configuration) ([full reference](docs/configuration.md)) · [Command reference](#command-reference)
+- [Example: a VM with three disks, per backend](examples/)
 - [Recovery plans](#recovery-plans)
 - [Write your own backend](#write-your-own-backend)
 - [Known limitations](#known-limitations) · [Roadmap](#roadmap)
@@ -122,7 +123,8 @@ Portworx and Longhorn VMs side by side.
 | Tested with | Trident 26.06, ONTAP 9.16.1 | Portworx 3.7.1, Stork 26.4.2 | Longhorn 1.12.1 ↔ 1.13.0 (V1); V2 alpha, untested |
 | Docs | [docs/netapp.md](docs/netapp.md) | [docs/portworx.md](docs/portworx.md) | [docs/longhorn.md](docs/longhorn.md) |
 
-Not seeing your storage? A backend is one Python class. See [Write your own backend](#write-your-own-backend).
+Want to try one? [examples/](examples/) has a VM with three disks and the setup, config and commands for each
+backend. Not seeing your storage? A backend is one Python class. See [Write your own backend](#write-your-own-backend).
 
 ---
 

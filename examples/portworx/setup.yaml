@@ -1,0 +1,13 @@
+# Both clusters: Portworx Enterprise with PX-DR + Stork; px-csi-replicated exists by default.
+# Source cluster only: the image the root disk is cloned from.
+apiVersion: harvesterhci.io/v1beta1
+kind: VirtualMachineImage
+metadata:
+  name: leap16
+  namespace: production
+spec:
+  backend: cdi
+  displayName: leap16
+  sourceType: download
+  targetStorageClassName: px-csi-replicated
+  url: https://download.opensuse.org/repositories/openSUSE:/Leap:/16.0:/Images/images/Leap-16.0-Minimal-VM.x86_64-Cloud.qcow2

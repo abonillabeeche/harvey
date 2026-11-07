@@ -1,0 +1,37 @@
+# Apply on BOTH clusters (same names on both sides keep things simple).
+# Prerequisites (storage admin): Trident backends for the peered SVMs, see ../../docs/netapp.md#what-harvey-expects-from-the-netapp-side
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: netapp-iscsi
+provisioner: csi.trident.netapp.io
+parameters:
+  backendType: ontap-san
+  sanType: iscsi
+  fsType: ext4
+  trident.netapp.io/replication: "true"     # recommended by NetApp for mirrored volumes
+allowVolumeExpansion: true
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: netapp-nfs
+provisioner: csi.trident.netapp.io
+parameters:
+  backendType: ontap-nas
+  fsType: nfs
+  trident.netapp.io/replication: "true"
+allowVolumeExpansion: true
+---
+# Source cluster only: the image the root disk is cloned from (CDI-backed, lands on NetApp)
+apiVersion: harvesterhci.io/v1beta1
+kind: VirtualMachineImage
+metadata:
+  name: leap16
+  namespace: production
+spec:
+  backend: cdi
+  displayName: leap16
+  sourceType: download
+  targetStorageClassName: netapp-iscsi
+  url: https://download.opensuse.org/repositories/openSUSE:/Leap:/16.0:/Images/images/Leap-16.0-Minimal-VM.x86_64-Cloud.qcow2
