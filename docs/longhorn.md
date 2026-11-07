@@ -132,9 +132,10 @@ any), then the PVCs. Harvey recreates the VM from the new primary right after. I
 
 ### A new volume's BackupVolume can sync after its Backup
 
-Longhorn's webhook also needs the synced Backup CR's labels and the BackupVolume CR on the DR cluster. For a
-brand-new volume, the BackupVolume can show up after the Backup, so Harvey waits for all three before it creates
-the DR volume.
+Longhorn's volume mutator reads the synced Backup CR's `status.backupTargetName` and then the BackupVolume CR on
+the DR cluster. The DR cluster's backup controller fills that status in a little after the Backup CR appears, and
+for a brand-new volume the BackupVolume can arrive later still. Without both, creating the DR volume fails with
+`backup target name and volume name cannot be empty`. Harvey waits for them first.
 
 ### Synced backups report an unknown block size
 
@@ -142,6 +143,20 @@ A Backup CR that a cluster learns about through the backup target sync has `spec
 seen both ways between Longhorn 1.12.1 and 1.13.0. Longhorn's volume mutator copies that value into a new DR
 volume, and the CRD schema then rejects it (only 2 MiB and 16 MiB are valid). Harvey sets the source backup's real
 block size on the synced Backup CR before it creates the DR volume, and logs that it did.
+
+### Standalone PVCs in a recovery group need detached recurring backups
+
+Longhorn's recurring jobs skip **detached** volumes by default. A standalone PVC in a recovery group that nothing
+mounts therefore only gets new backups at protect, planned failover and reprotect, and its lag keeps growing in
+`replication status`. Turn on the Longhorn setting `allow-recurring-job-while-volume-detached` (global) if those
+volumes change outside of Harvey operations.
+
+### Harvey trusts the engine, not the volume, for "restored"
+
+A DR volume's `status.lastBackup` names the newest backup it should restore. Only the engine's
+`status.lastRestoredBackup` proves that the data was restored. Harvey's final sync and `replication status`
+require the engine. With the V2 engine in the lab, `lastBackup` moved on while the engine never restored
+anything (see the V2 section below), and the volume shows `restore not confirmed` instead of `up to date`.
 
 ### Storage classes
 
@@ -176,6 +191,22 @@ timestamps were written to both disks every 5 seconds.
 | unplanned failover (source unreachable) | **31 s** to Running. Reported RPO ≤ 180 s; real loss 151–156 s. The two disks were a few seconds apart |
 | reprotect after the unplanned failover | the stale primary was demoted, disks replaced, replication running again |
 | recovery group: 2 VMs + 1 standalone PVC | protect, planned failover naming one member (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
+
+## V2 data engine: lab findings (alpha)
+
+far-edge (Longhorn 1.12.1, V2 on NVMe) → harvester-ai (Longhorn 1.12.1, V2 on a 100 GiB LV, two NUMA nodes):
+
+- **protect works**: V2 backups to S3, V2 standby DR volumes created on the other cluster.
+- **Restores don't complete on harvester-ai.** A V2 restore exposes the volume through a temporary NVMe-TCP
+  target and attaches it with the host's NVMe initiator. On harvester-ai the kernel's NVMe work queue hung in
+  `nvme_scan_work`: controllers stayed in `deleting`, no namespace device appeared, and every restore attempt
+  failed ("after restore flow failure"). So the DR volume could never be activated. Clearing it needs a reboot.
+  This is a host/kernel issue to investigate (native NVMe multipath is on; NVMe-TCP over loopback to SPDK on the
+  same node). It isn't a Harvey issue, but it's why V2 stays alpha.
+- **Getting V2 to start at all** on that host needed two things. First, the leftover kernel arguments
+  `default_hugepagesz=1G hugepages=128` had to go: DPDK failed with "EAL: Cannot init memory". Second, enough
+  2 MiB hugepages per NUMA node: Harvester's `longhorn-v2-data-engine-memory-size` is split across sockets,
+  while SPDK's memory size has to fit on one.
 
 ## RPO and RTO
 

@@ -21,6 +21,8 @@ Pluggable storage backends and Portworx async DR.
 - **Recovery groups**: `harvey group add/remove/list/show` (label `harvey.io/recovery-group` on VMs and standalone
   PVCs); protect, failover, reprotect, failback and unprotect act on whole groups; a group's storage is synced and
   promoted once, after all its VMs stopped; `failover group`; `--group` on protect/reprotect/unprotect
+- Longhorn: a restore counts only when the engine reports it (`lastRestoredBackup`), not the volume's
+  `lastBackup`; wait for the synced Backup CR's `status.backupTargetName` before creating a DR volume
 - **Shared-disk guard**: any operation on a VM that shares a disk with a VM outside its group is refused, with
   the `harvey group add` command to fix it
 - `harvey.io/primary-since`: after an unplanned failover the newer primary wins, the stale copy is shown in

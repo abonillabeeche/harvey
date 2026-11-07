@@ -50,6 +50,7 @@ GROUPS = {
     "schedulepolicy":    ("apis/stork.libopenstorage.org/v1alpha1", "schedulepolicies"),
     "dv":             ("apis/cdi.kubevirt.io/v1beta1", "datavolumes"),
     "lhvolume":       ("apis/longhorn.io/v1beta2", "volumes"),
+    "lhengine":       ("apis/longhorn.io/v1beta2", "engines"),
     "lhsnapshot":     ("apis/longhorn.io/v1beta2", "snapshots"),
     "lhbackup":       ("apis/longhorn.io/v1beta2", "backups"),
     "lhbackupvolume": ("apis/longhorn.io/v1beta2", "backupvolumes"),

@@ -564,7 +564,9 @@ backend against an in-memory fake Kubernetes API.
   in an isolated namespace, not just the VM spec.
 - [ ] `harvey bench`: repeatable failover/failback measurements (RTO per phase, RPO from an in-guest marker,
   database consistency checks) written to CSV.
-- [ ] Longhorn V2 data engine: lab test (needs two clusters with V2 disks), then drop the alpha label.
+- [ ] Longhorn V2 data engine: protect works; restores stalled in the lab on a host NVMe-TCP hang (details in
+  [docs/longhorn.md](docs/longhorn.md#v2-data-engine-lab-findings-alpha)). Retest on a clean host, then drop the
+  alpha label.
 - [ ] Longhorn V1: restore a missing backing image on the DR cluster automatically, under its original name,
   from its backing-image backup.
 - [ ] Per-site adjustments at promotion (node affinity, NAD or StorageClass changes) for DR sites that aren't

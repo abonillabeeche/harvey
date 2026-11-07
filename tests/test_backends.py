@@ -249,7 +249,10 @@ def _lh_dr_cluster(standby=True, last="backup-aaa", snap_time="2026-11-07T10:00:
            "spec": {"Standby": standby, "frontend": ""},
            "status": {"isStandby": standby, "lastBackup": last}}
     bk = {"metadata": {"name": last, "namespace": "longhorn-system"}, "status": {"snapshotCreatedAt": snap_time}}
-    return FakeKube("b", [("lhvolume", "longhorn-system", vol), ("lhbackup", "longhorn-system", bk)])
+    eng = {"metadata": {"name": "pvc-123-e-0", "namespace": "longhorn-system", "labels": {"longhornvolume": "pvc-123"}},
+           "status": {"lastRestoredBackup": last}}
+    return FakeKube("b", [("lhvolume", "longhorn-system", vol), ("lhbackup", "longhorn-system", bk),
+                          ("lhengine", "longhorn-system", eng)])
 
 
 class _ActivatingKube(FakeKube):
@@ -311,3 +314,17 @@ def test_lh_status_reports_up_to_date_standby():
     (row,) = be.volume_status("a", "b", "demo", "vm1", ["vm1-root"])
     assert row.src_state == "backup/5m" and row.dst_state == "standby" and row.repl_state == "up to date"
     assert row.healthy is True and "v2" in row.note and "alpha" in row.note
+
+
+
+def test_lh_status_does_not_trust_volume_lastbackup_without_the_engine():
+    # seen with the V2 engine: volume.status.lastBackup moved on, the engine never restored it
+    a = FakeKube("a", [("pvc", "demo", _pvc("vm1-root", "demo", "pvc-123")),
+                       ("pv", None, {"metadata": {"name": "pvc-123"},
+                                     "spec": {"csi": {"driver": "driver.longhorn.io", "volumeHandle": "pvc-123"}}}),
+                       ("lhvolume", "longhorn-system", {"metadata": {"name": "pvc-123", "labels": {L_GROUP: "enabled"}},
+                                                        "spec": {"dataEngine": "v2"}})])
+    b = _lh_dr_cluster()
+    b.objs[("lhengine", "longhorn-system", "pvc-123-e-0")]["status"]["lastRestoredBackup"] = ""
+    (row,) = LonghornBackend({"a": a, "b": b}, {}, {}, print).volume_status("a", "b", "demo", "vm1", ["vm1-root"])
+    assert row.repl_state == "restore not confirmed" and row.healthy is False

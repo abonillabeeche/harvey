@@ -182,7 +182,7 @@ class LonghornBackend(StorageBackend):
                 last_sync = time.time()
             v = k.get("lhvolume", NS, volume) or {}
             st = v.get("status") or {}
-            if st.get("lastBackup") == backup:
+            if st.get("lastBackup") == backup and self._engine_restored(dst, volume) == backup:
                 return v
             time.sleep(5)
         raise ReplicationError(f"{dst}: DR volume {volume} did not restore backup {backup} within "
@@ -209,10 +209,11 @@ class LonghornBackend(StorageBackend):
                 last_sync = time.time()
             b = k.get("lhbackup", NS, backup)
             labels = ((b or {}).get("metadata") or {}).get("labels") or {}
-            # the mutator also needs the synced Backup CR's target/volume labels and the BackupVolume CR; a brand-new
-            # volume's BackupVolume can show up after its Backup
-            if b is not None and labels.get("backup-target") and labels.get("backup-volume") and \
-                    self._backup_volume(dst, volume) is not None:
+            # the volume mutator reads the synced Backup CR's status.backupTargetName (filled in by the DR cluster's
+            # backup controller a little after the CR appears) and then the BackupVolume CR, which for a brand-new
+            # volume can also show up after the Backup
+            if b is not None and ((b.get("status") or {}).get("backupTargetName") or "") and \
+                    labels.get("backup-volume") and self._backup_volume(dst, volume) is not None:
                 cur = str((b.get("spec") or {}).get("backupBlockSize") or "")
                 if cur not in ("2097152", "16777216"):
                     k.merge_patch("lhbackup", NS, backup, {"spec": {"backupBlockSize": str(block_size or 2097152)}})
@@ -222,6 +223,17 @@ class LonghornBackend(StorageBackend):
             time.sleep(3)
         raise ReplicationError(f"{dst}: backup {backup} not visible through BackupTarget '{self.target}' after "
                                f"{self.timeouts['transfer']}s")
+
+    def _engine_restored(self, cluster: str, volume: str) -> Optional[str]:
+        """The backup the volume's engine reports as restored. The volume's status.lastBackup only says which
+        backup is the newest one to restore: seen with the V2 engine, it moved to the new backup while the
+        engine never restored it (V2 restore stuck on the host's NVMe-TCP initiator). Only the engine's
+        status.lastRestoredBackup proves the data is there."""
+        for e in self.k[cluster].list("lhengine", NS, label_selector=f"longhornvolume={volume}"):
+            r = (e.get("status") or {}).get("lastRestoredBackup")
+            if r:
+                return r
+        return None
 
     def _templates(self, cluster: str, ns: str, claim: str) -> Tuple[dict, dict]:
         """Clean PV and PVC specs to recreate on the DR site at promotion."""
@@ -394,9 +406,16 @@ class LonghornBackend(StorageBackend):
             if not rst.get("isStandby"):
                 vs.repl_state = "activated"
             else:
-                vs.repl_state = "up to date" if last and last == newest else ("restoring" if last else "initial restore")
+                restored = self._engine_restored(replica, v)
+                if restored and restored != last:
+                    vs.repl_state = f"restoring {last}"
+                elif not restored and last:
+                    vs.repl_state = "restore not confirmed"
+                else:
+                    vs.repl_state = "up to date" if last and last == newest else ("restoring" if last else "initial restore")
             vs.transfer = "idle" if last == newest else "restoring"
-            vs.healthy = bool(rst.get("isStandby") and last and plabels.get(L_GROUP) == "enabled")
+            vs.healthy = bool(rst.get("isStandby") and last and plabels.get(L_GROUP) == "enabled"
+                              and self._engine_restored(replica, v))
             eng = pvol.get("spec", {}).get("dataEngine", "v1")
             vs.note = "v2 · alpha" if eng == "v2" else eng
             rows.append(vs)
