@@ -1,25 +1,61 @@
 # NetApp backend (ONTAP SnapMirror through Trident)
 
+All Harvey settings are listed in the [configuration reference](configuration.md).
+
 Harvey's `netapp` backend replicates VM disks with **ONTAP SnapMirror** and drives it through Trident's
 `TridentMirrorRelationship` (TMR) objects. NetApp moves the disk data. Harvey moves the VM spec, Secrets,
 ConfigMaps and NADs, and orchestrates the failover, the final sync, the promote and the failback.
 
 The backend is selected automatically for VMs whose PVs use the `csi.trident.netapp.io` CSI driver.
 
-## Requirements
+## What Harvey expects from the NetApp side
 
-- **Trident 22.10 or later** on both clusters, each with an ONTAP backend (tested: Trident 26.06.1, ONTAP 9.16.1).
-- The two ONTAP clusters **cluster-peered**, and the SVMs **vserver-peered** with `-applications snapmirror`.
-  SnapMirror licensed on both. The SVM names must be **unique** across the two sides (`svm0` on both breaks the
-  relationship naming).
-- An **ONTAP job schedule** on the destination cluster, either a built-in one such as `5min` or a custom cron.
-  It sets the RPO of an unplanned failover. 5 minutes is NetApp's supported minimum. 1 minute works but is
-  unsupported.
-- VM disks on Trident `ontap-san` (iSCSI or NVMe/TCP) or `ontap-nas` (NFS) StorageClasses. One VM can mix
-  them. Map StorageClass names that differ between sites with `replication.storage_class_map`.
-- No ONTAP credentials in Harvey's config. For every PVC, Harvey follows PV → TridentVolume →
-  TridentBackendConfig and uses that backend's `managementLIF` and credentials Secret. An SVM-scoped `vsadmin`
-  login is enough. To override per cluster:
+Harvey isn't picky about how the arrays are laid out. Aggregates, volume names, QoS, export policies, LIF layout
+and protocols are whatever Trident already uses. What it needs is **SnapMirror working through Trident**, plus
+three small things of its own. A storage admin can go through this as a checklist.
+
+### NetApp's own prerequisites for Trident replication
+
+These come from NetApp's
+[Trident volume replication docs](https://docs.netapp.com/us-en/trident/trident-use/vol-volume-replicate.html).
+Harvey adds nothing here:
+
+- [ ] **Trident 22.10 or later** on both Kubernetes clusters, each with an ONTAP backend (tested: Trident 26.06.1,
+  ONTAP 9.16.1).
+- [ ] **SnapMirror asynchronous license** on both ONTAP clusters. It's part of ONTAP One and the Data Protection
+  bundle. Only asynchronous SnapMirror is supported.
+- [ ] **Cluster peering and SVM peering** between the two ONTAP clusters, with SVM peering for SnapMirror
+  (`vserver peer create ... -applications snapmirror`).
+- [ ] **Unique SVM names** on the two sides. NetApp lists this as a requirement.
+- [ ] **On the DR cluster, Trident's backend is the peered SVM.** The SVM that receives the mirrors must be the
+  one Trident manages there.
+- [ ] **Supported drivers:** `ontap-nas` (NFS) and `ontap-san` (iSCSI, FC, NVMe/TCP; NVMe needs ONTAP 9.15.1 or
+  later). **Not supported:** `ontap-nas-economy`, `ontap-san-economy`, `ontap-nas-flexgroup`, and ASA r2 systems.
+- [ ] **A SnapMirror policy and an ONTAP job schedule** that exist on the destination cluster. The built-in
+  `MirrorAllSnapshots` policy and `5min` schedule are fine (5 minutes is NetApp's supported minimum).
+- [ ] *Recommended by NetApp:* the source StorageClass has the parameter `trident.netapp.io/replication: "true"`.
+  Trident 26.06 replicated without it in the lab, so Harvey doesn't require it. Set it anyway to stay inside
+  NetApp's documented configuration.
+
+### What Harvey itself needs
+
+- [ ] **The account Trident already uses is enough.** Harvey doesn't need cluster admin or an account of its own.
+  It reuses the credentials of the Trident backend that owns each PVC. In the lab that was an **SVM-scoped** login
+  with the `vsadmin` role, on the SVM management LIF. Harvey calls these ONTAP REST APIs on the destination SVM:
+
+  | Call | Why |
+  |---|---|
+  | `GET /api/snapmirror/relationships` | state, health, lag, recovery point |
+  | `POST /api/snapmirror/relationships/{uuid}/transfers` | final update before a planned failover |
+  | `PATCH .../transfers/{uuid}` (`state: aborted`) | abort a stalled or conflicting transfer |
+  | `PATCH /api/snapmirror/relationships/{uuid}` (`paused`, `broken_off`, `snapmirrored`) | quiesce + break when Trident left a volume DP, restart a stalled baseline |
+  | `GET /api/storage/volumes` | check that a promoted volume really is read-write |
+
+  The login needs the `http` application (ONTAP REST) enabled, which Trident's REST mode already requires.
+- [ ] **Backends defined as `TridentBackendConfig` objects with a username/password Secret.** Harvey finds a PVC's
+  ONTAP endpoint and credentials by following PV → TridentVolume → TridentBackendConfig → `managementLIF` + Secret.
+  If a backend was created with `tridentctl` (no TridentBackendConfig), or uses certificate authentication or
+  AWS Secrets Manager credentials, set the endpoint per cluster in Harvey's config instead:
 
   ```yaml
   clusters:
@@ -27,6 +63,20 @@ The backend is selected automatically for VMs whose PVs use the `csi.trident.net
       kubeconfig: ~/.kube/dr.yaml
       ontap: {host: 192.0.2.10, username: vsadmin, password_env: DR_ONTAP_PW}
   ```
+
+- [ ] **Network access from wherever Harvey runs** to the ONTAP management LIF of **both** sites over HTTPS
+  (TCP 443). The DR side matters most: status, final sync and promote all talk to the destination. Harvey accepts
+  ONTAP's self-signed certificate.
+- [ ] Optional: map StorageClass names that differ between sites with `replication.storage_class_map`. One VM can
+  mix NFS and iSCSI disks.
+
+### Not required
+
+- Harvey doesn't create or change SVMs, peers, policies, schedules or export policies. Everything it does goes
+  through Trident's `TridentMirrorRelationship` objects and the REST calls above.
+- No ONTAP software beyond SnapMirror. No SnapCenter, no BlueXP, no Trident Protect.
+- No specific aggregate or volume layout. VMs created from Harvester images work: their root disk is a FlexClone
+  of the image volume, and SnapMirror sends it as a full, independent copy.
 
 ## Configuration
 

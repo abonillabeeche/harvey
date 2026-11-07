@@ -61,12 +61,18 @@ CONFIG_TEMPLATE = {
     },
     "defaults": {"source": "primary", "destination": "dr"},
     "replication": {
-        # backend: netapp | portworx   # optional; default = picked per VM from the CSI driver of its PVs
+        # backend: netapp | portworx | longhorn   # optional; default = picked per VM from the CSI driver
+        # all keys and defaults: docs/configuration.md
         "storage_class_map": {},            # source SC -> destination SC, when names differ (NetApp)
         "max_lag_seconds": 900,             # health-check threshold
         "netapp": {
             "policy":   "MirrorAllSnapshots",   # an async SnapMirror policy (Trident supports async only)
             "schedule": "5min",                 # an ONTAP job schedule on the destination cluster
+        },
+        "longhorn": {
+            "backup_target": "harvey",          # Longhorn BackupTarget with the same name + URL on both clusters
+            "interval_minutes": 5,              # recurring backup cron
+            "retain": 12,
         },
         "portworx": {
             "interval_minutes": 15,             # Stork SchedulePolicy harvey-<N>min

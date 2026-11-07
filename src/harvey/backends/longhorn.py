@@ -1,4 +1,4 @@
-"""Longhorn backend (ALPHA): Longhorn disaster recovery (DR) volumes, V1 and V2 data engines.
+"""Longhorn backend: Longhorn disaster recovery (DR) volumes. V1 data engine: lab-tested. V2 data engine: ALPHA.
 
 Longhorn has no cluster-to-cluster replication. Its DR story is backup based: the primary volume is backed up
 to an S3/NFS backup target, and on the DR cluster a *DR volume* (a standby volume created from a backup)
@@ -28,8 +28,8 @@ Config (`replication.longhorn:`):
   retain: 12                   # backups kept by the recurring job
   replicas: null               # DR volume replica count (default: same as the source)
 
-Status: ALPHA. The V1 data engine path is lab-tested; V2 (SPDK) DR volumes are supported by Longhorn 1.12+
-(not with the sharded layout) but untested with Harvey.
+Status: the V1 data engine path is lab-tested. V2 (SPDK) DR volumes are supported by Longhorn 1.12+ (not with
+the sharded layout) but untested with Harvey, so V2 is ALPHA.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ class LonghornBackend(StorageBackend):
     name = "longhorn"
     drivers = (LONGHORN,)
     drop_annotation_prefixes = ("longhorn.io/",)
-    engine = "Longhorn DR volumes (alpha)"
+    engine = "Longhorn DR volumes"
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -249,7 +249,7 @@ class LonghornBackend(StorageBackend):
                 f"See docs/longhorn.md")
         if s.get("dataEngine") == "v2":
             self.log(f"  [yellow]{claim}: Longhorn V2 data engine: DR volumes are supported by Longhorn 1.12+ but "
-                     f"untested with Harvey (alpha)[/yellow]")
+                     f"untested with Harvey (V2 is alpha)[/yellow]")
         pv_t, pvc_t = self._templates(src, ns, claim)
         body = {"apiVersion": API, "kind": "Volume",
                 "metadata": {"name": volume, "namespace": NS,
@@ -388,7 +388,8 @@ class LonghornBackend(StorageBackend):
                 vs.repl_state = "up to date" if last and last == newest else ("restoring" if last else "initial restore")
             vs.transfer = "idle" if last == newest else "restoring"
             vs.healthy = bool(rst.get("isStandby") and last and plabels.get(L_GROUP) == "enabled")
-            vs.note = f"{pvol.get('spec', {}).get('dataEngine', 'v1')} · alpha"
+            eng = pvol.get("spec", {}).get("dataEngine", "v1")
+            vs.note = "v2 · alpha" if eng == "v2" else eng
             rows.append(vs)
         return rows
 

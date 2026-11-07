@@ -15,7 +15,7 @@
   <a href="https://github.com/abonillabeeche/harvey/releases"><img src="https://img.shields.io/github/v/release/abonillabeeche/harvey" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/backend-NetApp%20SnapMirror-0067C5" alt="Backend: NetApp SnapMirror">
   <img src="https://img.shields.io/badge/backend-Portworx%20async%20DR-6E3FF3" alt="Backend: Portworx async DR">
-  <img src="https://img.shields.io/badge/backend-Longhorn%20DR%20volumes%20(alpha)-5F224B" alt="Backend: Longhorn DR volumes (alpha)">
+  <img src="https://img.shields.io/badge/backend-Longhorn%20DR%20volumes-5F224B" alt="Backend: Longhorn DR volumes">
 </p>
 
 ---
@@ -65,7 +65,7 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 - [Priorities: who comes back first](#priorities-who-comes-back-first)
 - [Measured in the lab](#measured-in-the-lab)
 - [Safety rails](#safety-rails)
-- [Installation](#installation) · [Configuration](#configuration) · [Command reference](#command-reference)
+- [Installation](#installation) · [Configuration](#configuration) ([full reference](docs/configuration.md)) · [Command reference](#command-reference)
 - [Recovery plans](#recovery-plans)
 - [Write your own backend](#write-your-own-backend)
 - [Known limitations](#known-limitations) · [Roadmap](#roadmap)
@@ -109,17 +109,17 @@ flowchart LR
 Harvey picks the backend per VM from the CSI driver of its PVs, so one installation can protect NetApp,
 Portworx and Longhorn VMs side by side.
 
-| | **NetApp** (`netapp`) | **Portworx** (`portworx`) | **Longhorn** (`longhorn`) · *alpha* |
+| | **NetApp** (`netapp`) | **Portworx** (`portworx`) | **Longhorn** (`longhorn`) |
 |---|---|---|---|
 | Replication engine | ONTAP SnapMirror (async) | Portworx async DR through an S3 object store | Longhorn backups + DR (standby) volumes through an S3/NFS backup target |
 | Driven through | Trident `TridentMirrorRelationship` per PVC | Stork `MigrationSchedule` per VM (volume-only) | Longhorn `RecurringJob`, `Backup` and standby `Volume` per PVC |
-| CSI driver | `csi.trident.netapp.io` | `pxd.portworx.com` | `driver.longhorn.io` (V1 and V2 data engines) |
+| CSI driver | `csi.trident.netapp.io` | `pxd.portworx.com` | `driver.longhorn.io` (V1; V2 is alpha) |
 | Schedule | ONTAP job schedule (`5min` minimum supported) | Stork interval policy (15 min recommended) | recurring backup cron (5 min default) |
 | Planned failover | final SnapMirror update → **RPO 0** | final one-off Migration → **RPO 0** | final backup + incremental restore → **RPO 0** |
 | Unplanned recovery point | newest replicated snapshot, per volume | last migration, the same point for all disks of the VM | last restored backup, per volume |
 | Promote | TMR → `promoted`, verified and broken via ONTAP REST if needed | fence: Stork `applicationActivated` on the DR copy | activate the DR volume, then create PV + PVC |
 | Reprotect | reverse resync (incremental) | reverse migration (full copy, then incremental) | DR volume of the new primary (full restore, then incremental) |
-| Tested with | Trident 26.06, ONTAP 9.16.1 | Portworx 3.7.1, Stork 26.4.2 | Longhorn 1.12.1 ↔ 1.13.0, **V1**; V2 untested |
+| Tested with | Trident 26.06, ONTAP 9.16.1 | Portworx 3.7.1, Stork 26.4.2 | Longhorn 1.12.1 ↔ 1.13.0 (V1); V2 alpha, untested |
 | Docs | [docs/netapp.md](docs/netapp.md) | [docs/portworx.md](docs/portworx.md) | [docs/longhorn.md](docs/longhorn.md) |
 
 Not seeing your storage? A backend is one Python class. See [Write your own backend](#write-your-own-backend).
@@ -347,11 +347,12 @@ From source: `git clone … && cd harvey && pip install .`
   kubeconfig (token or client certificate) or the Rancher proxy.
 - **NetApp:** Trident ≥ 22.10 on ONTAP, the two ONTAP clusters cluster-peered and the SVMs vserver-peered for
   SnapMirror (unique SVM names), an ONTAP job schedule on both sides. Harvey discovers the ONTAP credentials
-  from Trident's backend config (an SVM-scoped `vsadmin` is enough). Details in [docs/netapp.md](docs/netapp.md).
+  from Trident's backend config (an SVM-scoped `vsadmin` is enough). The full checklist for a storage admin is in
+  [docs/netapp.md](docs/netapp.md#what-harvey-expects-from-the-netapp-side).
 - **Portworx:** Portworx Enterprise with PX-DR and Stork on both clusters (same version), an S3 bucket both
   clusters can reach, and one Stork ClusterPair per direction. Setup is in
   [docs/portworx.md](docs/portworx.md).
-- **Longhorn (alpha):** Longhorn 1.8 or later on both clusters (1.12+ for V2), the same Longhorn `BackupTarget`
+- **Longhorn:** Longhorn 1.8 or later on both clusters (1.12+ for V2), the same Longhorn `BackupTarget`
   on both clusters, and VM disks that aren't tied to a cluster-local backing image (use CDI images, see
   [docs/longhorn.md](docs/longhorn.md)).
 
@@ -389,14 +390,15 @@ replication:
     pairs:                                     # Stork ClusterPair per direction ("name" or "namespace/name")
       on-prem->cloud: harvey-to-cloud
       cloud->on-prem: harvey-to-onprem
-  longhorn:                                    # alpha
+  longhorn:
     backup_target: harvey                      # Longhorn BackupTarget with the same name + URL on both clusters
     interval_minutes: 5                        # recurring backup cron
     retain: 12
     # replicas: 2                              # DR volume replicas (default: same as the source)
 ```
 
-Configs from 0.2 (top-level `replication.policy` / `schedule`) keep working.
+Configs from 0.2 (top-level `replication.policy` / `schedule`) keep working. Every key, default, environment
+variable and label is listed in the [configuration reference](docs/configuration.md).
 
 ---
 
@@ -508,9 +510,9 @@ backend against an in-memory fake Kubernetes API.
 - **Portworx: reprotect is a full copy.** Portworx restores into a new volume on the old primary. Stork's
   KubeVirt failback cleanup also deletes the stopped replica VM, which Harvey recreates. Details in
   [docs/portworx.md](docs/portworx.md).
-- **Longhorn is alpha and backup based.** Every recovery point is a backup, reprotect is a full restore, and a V1
+- **Longhorn is backup based.** Every recovery point is a backup, reprotect is a full restore, and a V1
   disk built on a Harvester backing image only restores where a backing image with the same name exists (Harvester
-  names them after the image UID). V2 is untested. Details in [docs/longhorn.md](docs/longhorn.md).
+  names them after the image UID). The V2 data engine is alpha (untested). Details in [docs/longhorn.md](docs/longhorn.md).
 - **`--test` mode** boots copies of the VM spec in shadow namespaces but does not clone the replica volumes yet.
 
 ---
@@ -548,7 +550,7 @@ git tag v0.3.0 && git push origin v0.3.0
 
 | Version | Highlights |
 |---|---|
-| 0.3 | Pluggable storage backends; **Portworx async DR**; **Longhorn DR volumes (alpha, V1 lab-tested)** (Stork volume-only migrations, fencing, RPO from the migration trigger time); stale-primary handling after unplanned failovers; health-check scoped to the cluster pair |
+| 0.3 | Pluggable storage backends; **Portworx async DR** (Stork volume-only migrations, fencing, RPO from the migration trigger time); **Longhorn DR volumes** (V1 lab-tested, V2 alpha); stale-primary handling after unplanned failovers; health-check scoped to the cluster pair |
 | 0.2 | Storage-aware DR with NetApp SnapMirror via Trident: protect, replication status with lag, metadata sync, planned (lossless) and unplanned failover, reprotect, failback; kubeconfig or Rancher access; ONTAP credential discovery |
 | 0.1 | Stop/start failover, priorities and startup delays, recovery plans with hooks, DR test mode, RTO tracking, audit log, health-check |
 

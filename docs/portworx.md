@@ -1,5 +1,7 @@
 # Portworx async DR backend
 
+All Harvey settings are listed in the [configuration reference](configuration.md).
+
 Harvey's `portworx` backend replicates VM disks with Portworx async DR (Stork). Portworx moves the volume
 data and the PV/PVC objects. Harvey moves the VM spec, Secrets, ConfigMaps and NADs, and orchestrates the
 failover, the fencing and the failback.

@@ -1,9 +1,10 @@
-# Longhorn backend (ALPHA): DR volumes, V1 and V2 data engines
+# Longhorn backend: DR volumes (V1 data engine; V2 is alpha)
 
-> **Status: alpha.** The **V1** data engine path passed a full lab cycle (protect, planned failover, reprotect,
-> failback, unplanned failover, reprotect of a stale primary) between Longhorn 1.12.1 and 1.13.0. The **V2** (SPDK)
-> data engine is supported by Longhorn for DR volumes but **untested** with Harvey. Expect rough edges and report
-> them.
+All Harvey settings are listed in the [configuration reference](configuration.md).
+
+> **Status.** **V1** data engine: passed a full lab cycle (protect, planned failover, reprotect, failback, unplanned
+> failover, reprotect of a stale primary) between Longhorn 1.12.1 and 1.13.0. **V2** (SPDK) data engine: **alpha**.
+> Longhorn supports V2 DR volumes, but they're untested with Harvey.
 
 Longhorn doesn't replicate between clusters. Its disaster recovery is built on backups: the primary volume is
 backed up to a backup target (S3 or NFS), and on the DR cluster a **DR volume** (a standby volume created from a
