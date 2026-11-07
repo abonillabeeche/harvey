@@ -1,0 +1,145 @@
+# NetApp backend (ONTAP SnapMirror through Trident)
+
+Harvey's `netapp` backend replicates VM disks with **ONTAP SnapMirror** and drives it through Trident's
+`TridentMirrorRelationship` (TMR) objects. NetApp moves the disk data. Harvey moves the VM spec, Secrets,
+ConfigMaps and NADs, and orchestrates the failover, the final sync, the promote and the failback.
+
+The backend is selected automatically for VMs whose PVs use the `csi.trident.netapp.io` CSI driver.
+
+## Requirements
+
+- **Trident 22.10 or later** on both clusters, each with an ONTAP backend (tested: Trident 26.06.1, ONTAP 9.16.1).
+- The two ONTAP clusters **cluster-peered**, and the SVMs **vserver-peered** with `-applications snapmirror`.
+  SnapMirror licensed on both. The SVM names must be **unique** across the two sides (`svm0` on both breaks the
+  relationship naming).
+- An **ONTAP job schedule** on the destination cluster, either a built-in one such as `5min` or a custom cron.
+  It sets the RPO of an unplanned failover. 5 minutes is NetApp's supported minimum. 1 minute works but is
+  unsupported.
+- VM disks on Trident `ontap-san` (iSCSI or NVMe/TCP) or `ontap-nas` (NFS) StorageClasses. One VM can mix
+  them. Map StorageClass names that differ between sites with `replication.storage_class_map`.
+- No ONTAP credentials in Harvey's config. For every PVC, Harvey follows PV → TridentVolume →
+  TridentBackendConfig and uses that backend's `managementLIF` and credentials Secret. An SVM-scoped `vsadmin`
+  login is enough. To override per cluster:
+
+  ```yaml
+  clusters:
+    dr:
+      kubeconfig: ~/.kube/dr.yaml
+      ontap: {host: 192.0.2.10, username: vsadmin, password_env: DR_ONTAP_PW}
+  ```
+
+## Configuration
+
+```yaml
+replication:
+  netapp:
+    policy: MirrorAllSnapshots     # an async SnapMirror policy (Trident supports async only)
+    schedule: 5min                 # ONTAP job schedule on the destination
+  storage_class_map: {}            # source SC -> destination SC when the names differ
+  max_lag_seconds: 900             # health-check threshold (schedule + transfer time)
+  timeouts: {tmr: 300, transfer: 1800, stall: 120}
+```
+
+0.2 configs that keep `policy` and `schedule` directly under `replication:` still work.
+
+## How it works
+
+Per PVC of a protected VM:
+
+| Where | Object | State |
+|---|---|---|
+| source cluster | `TridentMirrorRelationship <pvc>` | `promoted`. Exposes the ONTAP volume handle `svm:volume` |
+| destination cluster | `TridentMirrorRelationship <pvc>` | `established`, `remoteVolumeHandle` = the source handle, policy + schedule |
+| destination cluster | `PersistentVolumeClaim <pvc>` | annotated `trident.netapp.io/mirrorRelationship: <pvc>`. Trident provisions a DP volume on the peered SVM |
+
+### protect
+
+1. Creates a source TMR `promoted` per PVC and waits for its volume handle.
+2. Creates a destination TMR `established` and the annotated PVC per disk, then waits for the SnapMirror baseline.
+   A baseline that stops making progress (seen on memory-starved simulators) is aborted and restarted from its
+   checkpoint, up to 3 times.
+3. Copies Secrets, ConfigMaps and NADs and creates the replica VM `Halted`, with the same name, namespace, MAC
+   addresses and disk names. PVC templates and image references are dropped on the replica, because its disks
+   are the mirrored PVCs.
+
+VMs created from Harvester images work. Their root disk is a FlexClone of the image volume, and SnapMirror sends
+it as a full, independent copy (731 MB for a Leap 16 root disk in the lab).
+
+### Planned failover
+
+Metadata sync → stop the VM → **final SnapMirror update** per volume → promote → start.
+
+- The final update waits for a scheduled transfer that's already running, aborts a transfer that stalls for
+  `timeouts.stall` seconds, and retries up to 3 times.
+- Before it promotes, Harvey checks that the replicated snapshot is newer than the time the VM stopped. A VM is
+  promoted only with RPO 0.
+
+### Promote, and the Trident quirk
+
+With Trident 26.06.1 and ONTAP 9.16.1, a TMR can report `promoted` while the volume is still **DP**
+(read-only), so the VM can't attach it. This happens in two cases:
+
+- **A scheduled transfer is running.** Trident's break fails with "snapmirror transfer already in progress",
+  is requeued, and the TMR still ends up `promoted`.
+- **The relationship is already quiesced.** Trident marks it promoted without breaking it.
+
+Harvey therefore aborts a running transfer before it promotes, lets Trident promote, checks the volume type over
+the ONTAP REST API, and quiesces and breaks the relationship itself if the volume is still DP. NetApp has been told
+about the behavior.
+
+### Reprotect and failback
+
+`harvey reprotect` sets the old source's TMR to `reestablished`, with `remoteVolumeHandle` = the new primary's
+volume. That is a **reverse resync**: only changed blocks travel, so failback stays cheap even for large disks.
+`harvey failback` = planned failover back + reprotect.
+
+### Replication status
+
+`harvey replication status` reads the relationships from the destination ONTAP:
+
+- **State:** the TMR state on each side (`promoted → established`).
+- **Replication:** the SnapMirror state (`snapmirrored`) and its health.
+- **Lag:** ONTAP's `lag_time`, which is the worst-case data loss for an unplanned failover.
+- **Recovery point:** the timestamp of the newest exported snapshot.
+
+## Measured in the lab
+
+Two SUSE Virtualization clusters, each with Trident 26.06.1 against its own single-node ONTAP 9.16.1 simulator.
+The test VM was Leap 16 with an image-cloned iSCSI root disk, a 1 GiB iSCSI data disk and a 1 GiB NFS data disk.
+In-guest timestamps were written to all three disks every 5 seconds.
+
+| Scenario | Result |
+|---|---|
+| Planned failover | **72–101 s** over 3 runs (stop 9, final sync 43, promote 33, start 15 in the slowest run), **RPO 0** verified in the guest |
+| Failback (reverse resync + planned failover back) | **75–95 s** over 4 runs, **RPO 0** |
+| Unplanned failover | Harvey reported ≤ 65 s. Measured loss: 7 s on the data disks, 62 s on the root disk |
+| Steady-state lag, 1-minute schedule | 7–41 s (51 samples) |
+
+## Limits
+
+- **Asynchronous only.** Trident TMRs support async SnapMirror policies, with a 5-minute supported minimum
+  schedule. The ONTAP `Sync` policy works between the clusters but has no Trident integration. NetApp's zero-RPO
+  answer is MetroCluster.
+- **Per-volume consistency.** Each disk is its own SnapMirror relationship. After an unplanned failover, the disks
+  of one VM can come from different points in time (55 s apart in the lab). Planned failovers aren't affected,
+  because the VM is stopped before the final update. ONTAP consistency groups aren't available through Trident,
+  and VolumeGroupSnapshots don't work with replication yet.
+- **Scale.** One relationship per disk. ONTAP allows 100 or 250 concurrent transfers per system, depending on the
+  platform.
+- **Simulators.** A 6 GB ONTAP simulator runs out of WAFL memory under replication load, and transfers stall
+  silently. Give simulators 10 GB. Harvey's stall detection keeps a demo moving, but it's no substitute for memory.
+
+## Harvey and NetApp Trident Protect
+
+Trident Protect is NetApp's own application-level DR. Both were run side by side in the lab:
+
+| | Harvey + SnapMirror | Trident Protect 26.06 |
+|---|---|---|
+| Recovery point | per disk, crash-consistent | one snapshot of all of a VM's disks, guest frozen via qemu-guest-agent |
+| VM on the DR site | stopped replica always present | recreated at promotion from metadata in S3 |
+| Planned failover | 72–101 s | 166 s (1 run) |
+| Failback | reverse resync (changed blocks) | full re-copy in our run |
+| Extras | multi-VM plans, priorities, hooks, health checks, split-brain checks | backups, restores, clones, transformations, NetApp support |
+
+The two are complementary. Trident Protect gives an app-consistent recovery point and vendor support. Harvey adds
+ordering, preflight checks, status, health checks and the audit trail on top of SnapMirror.

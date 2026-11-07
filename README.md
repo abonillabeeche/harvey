@@ -61,12 +61,13 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 - [How it works](#how-it-works)
 - [Storage backends](#storage-backends)
 - [The DR lifecycle, in commands](#the-dr-lifecycle-in-commands)
+- [Priorities: who comes back first](#priorities-who-comes-back-first)
 - [Measured in the lab](#measured-in-the-lab)
 - [Safety rails](#safety-rails)
 - [Installation](#installation) · [Configuration](#configuration) · [Command reference](#command-reference)
 - [Recovery plans](#recovery-plans)
 - [Write your own backend](#write-your-own-backend)
-- [Known limitations](#known-limitations)
+- [Known limitations](#known-limitations) · [Roadmap](#roadmap)
 
 ---
 
@@ -118,7 +119,7 @@ VMs and Portworx VMs side by side.
 | Promote | TMR → `promoted`, verified and broken via ONTAP REST if needed | fence: Stork `applicationActivated` on the DR copy |
 | Reprotect | reverse resync (incremental) | reverse migration (full copy, then incremental) |
 | Tested with | Trident 26.06, ONTAP 9.16.1 | Portworx 3.7.1, Stork 26.4.2 |
-| Docs | this README | [docs/portworx.md](docs/portworx.md) |
+| Docs | [docs/netapp.md](docs/netapp.md) | [docs/portworx.md](docs/portworx.md) |
 
 Not seeing your storage? A backend is one Python class. See [Write your own backend](#write-your-own-backend).
 
@@ -232,6 +233,61 @@ planned outage, and no lost writes.
 
 ---
 
+## Priorities: who comes back first
+
+A real outage doesn't fail over one VM. It fails over a database, the application servers that need it and the
+web tier in front of them, in that order. Give each VM a priority with two labels, and Harvey orders every
+failover, failback and plan run by them:
+
+```bash
+kubectl -n production label vm db-01  failover-priority=100 failover-startup-time=60
+kubectl -n production label vm app-01 failover-priority=50  failover-startup-time=30
+kubectl -n production label vm app-02 failover-priority=50  failover-startup-time=30
+kubectl -n production label vm web-01 failover-priority=10
+```
+
+- **Higher priority = stopped last, started first.** The database keeps serving until everything that writes to
+  it is down, and it's running before anything that needs it starts.
+- **`failover-startup-time`** is how many seconds Harvey waits after starting that VM before it starts the next
+  one. That gives the database time to accept connections.
+- VMs without the label get priority 0. VMs with the same priority go in name order (namespace, then VM name);
+  in a recovery plan they go in the order the plan lists them.
+
+Preview the order with `--dry-run`. Nothing changes, and you can save the result as a recovery plan:
+
+```console
+$ harvey failover namespace production --dry-run
+              Failover Plan: on-prem → cloud
+╭────────┬─────────┬────────────┬─────────┬──────────┬───────────────╮
+│ Stop # │ Start # │ Namespace  │ VM Name │ Priority │ Startup Delay │
+├────────┼─────────┼────────────┼─────────┼──────────┼───────────────┤
+│      1 │       4 │ production │ web-01  │       10 │             — │
+│      2 │       2 │ production │ app-01  │       50 │           30s │
+│      3 │       3 │ production │ app-02  │       50 │           30s │
+│      4 │       1 │ production │ db-01   │      100 │           60s │
+╰────────┴─────────┴────────────┴─────────┴──────────┴───────────────╯
+
+DRY RUN — no changes will be made.
+  Phases: metadata sync → stop (lowest priority first) → final sync → promote replica volumes → start (highest priority first)
+  Would fail over production/web-01  (priority 10)
+  Would fail over production/app-01  (priority 50)
+  Would fail over production/app-02  (priority 50)
+  Would fail over production/db-01  (priority 100)
+──── Dry run complete ────
+
+Save this as a recovery plan? [y/n] (n): y
+Plan name: production-dr
+✓ Plan saved to ~/.config/harvey/plans/production-dr.yaml
+```
+
+<sub>Example VMs. The table layout is the one `harvey failover --dry-run` prints.</sub>
+
+The saved plan has one protection group per priority. Edit it to add hooks or change the order without
+relabeling VMs. In a plan, the group's `priority` and `startup_delay` override the labels. See
+[Recovery plans](#recovery-plans).
+
+---
+
 ## Measured in the lab
 
 All output in this README is from these runs, with cluster names shortened. Small Leap 16 VMs (5 GiB root disk cloned from an image plus a 1 GiB data disk). Inside each guest, a service
@@ -239,9 +295,9 @@ writes a UTC timestamp to every disk every 5 seconds, so any lost write shows up
 
 | Scenario | NetApp SnapMirror<br/><sub>two ONTAP 9.16.1 simulators</sub> | Portworx async DR<br/><sub>on-prem ↔ Vultr bare metal, over the internet</sub> |
 |---|---|---|
-| Planned failover | RTO **101 s**, RPO **0** | RTO **86 s**, RPO **0** |
-| Failback (planned failover back + reprotect) | RTO **87–90 s**, RPO **0** | RTO **119 s**, RPO **0** |
-| Unplanned failover | promote + start; disks of one VM can differ by about 1 min | **3 s** to Running; all disks from one point in time |
+| Planned failover | RTO **72–101 s** (3 runs), RPO **0** | RTO **86 s**, RPO **0** |
+| Failback (planned failover back + reprotect) | RTO **75–95 s** (4 runs), RPO **0** | RTO **119 s**, RPO **0** |
+| Unplanned failover | loss 7 s (data disks) to 62 s (root); disks of one VM can differ | **3 s** to Running; all disks from one point in time |
 | Old site comes back after an unplanned failover | Harvey refuses to sync over the newer primary | Stork suspends the old schedule itself (fence) |
 
 Results depend on link speed, change rate and array load. Measure your own: `harvey audit` keeps RTO and RPO
@@ -290,7 +346,7 @@ From source: `git clone … && cd harvey && pip install .`
   kubeconfig (token or client certificate) or the Rancher proxy.
 - **NetApp:** Trident ≥ 22.10 on ONTAP, the two ONTAP clusters cluster-peered and the SVMs vserver-peered for
   SnapMirror (unique SVM names), an ONTAP job schedule on both sides. Harvey discovers the ONTAP credentials
-  from Trident's backend config (an SVM-scoped `vsadmin` is enough).
+  from Trident's backend config (an SVM-scoped `vsadmin` is enough). Details in [docs/netapp.md](docs/netapp.md).
 - **Portworx:** Portworx Enterprise with PX-DR and Stork on both clusters (same version), an S3 bucket both
   clusters can reach, and one Stork ClusterPair per direction. Setup is in
   [docs/portworx.md](docs/portworx.md).
@@ -439,11 +495,28 @@ backend against an in-memory fake Kubernetes API.
   failover the disks of one VM can come from different points in time. Trident doesn't expose ONTAP consistency
   groups. Keep the array's concurrent-transfer limit in mind at scale.
 - **NetApp: Trident promote quirk (26.06 / ONTAP 9.16.1).** A TMR can say `promoted` while the volume is still
-  DP. Harvey verifies the volume and breaks the mirror itself.
+  DP. Harvey verifies the volume and breaks the mirror itself. Details in [docs/netapp.md](docs/netapp.md).
 - **Portworx: reprotect is a full copy.** Portworx restores into a new volume on the old primary. Stork's
   KubeVirt failback cleanup also deletes the stopped replica VM, which Harvey recreates. Details in
   [docs/portworx.md](docs/portworx.md).
 - **`--test` mode** boots copies of the VM spec in shadow namespaces but does not clone the replica volumes yet.
+
+---
+
+## Roadmap
+
+- [ ] **TODO: Recovery groups.** Make "an application" a first-class unit: a named set of VMs (for example the
+  label `harvey.io/recovery-group=billing`) that you protect, sync, fail over, reprotect and fail back with one
+  command. The group would report health and lag as a whole, and recovery plans would reference groups instead
+  of listing VMs. Where the storage allows it, all of a group's disks would share one recovery point: Portworx
+  can migrate the whole group in one Stork migration. Trident doesn't expose ONTAP consistency groups yet, so on
+  NetApp a group stays crash-consistent per volume until it does.
+- [ ] `plan run --test` that boots clones of the replica volumes (FlexClone on NetApp, snapshots on Portworx)
+  in an isolated namespace, not just the VM spec.
+- [ ] `harvey bench`: repeatable failover/failback measurements (RTO per phase, RPO from an in-guest marker,
+  database consistency checks) written to CSV.
+- [ ] Per-site adjustments at promotion (node affinity, NAD or StorageClass changes) for DR sites that aren't
+  identical.
 
 ---
 
