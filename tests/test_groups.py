@@ -127,3 +127,60 @@ def test_expand_plan_keeps_member_priorities():
     k.objs[("vm", "prod", "db")]["metadata"]["labels"]["failover-priority"] = "100"
     plan, notes = Replicator({"b": k}, {}, log=print).expand_plan([("prod", "web", 10, 0)], "b")
     assert ("prod", "db", 100, 0) in plan and len(plan) == 2 and "recovery group app" in notes[0]
+
+
+def test_failover_refuses_when_destination_is_already_primary():
+    # the NetApp preflight accepts already-promoted volumes (to resume a half-done failover); this orchestrator
+    # guard is what keeps it from "failing over" onto the site that already is the primary
+    REGISTRY["recorder"] = _Recorder
+    _Recorder.calls = []
+    src = _ClusterKube("a", [_vm("web", ["web-root"], status="Stopped", role="replica")])
+    dst = _ClusterKube("b", [_vm("web", ["web-root"], role="primary")])
+    rep = Replicator({"a": src, "b": dst}, {"backend": "recorder"}, log=lambda *_: None)
+    rep.sync_metadata = lambda *a, **k: []
+    with pytest.raises(ReplicationError, match="already primary on b"):
+        rep.failover([("prod", "web", 0, 0)], "a", "b")
+    assert _Recorder.calls == []                     # refused before any backend call
+    del REGISTRY["recorder"]
+
+
+def test_failover_refuses_a_destination_that_was_not_reprotected():
+    # after a failover a -> b, a holds the old copy (harvey.io/needs-reprotect) until reprotect; failing over
+    # back onto it would start the VM on stale data
+    REGISTRY["recorder"] = _Recorder
+    _Recorder.calls = []
+    old = _vm("web", ["web-root"], status="Stopped", role="replica")
+    old[2]["metadata"]["annotations"]["harvey.io/needs-reprotect"] = "true"
+    rep = Replicator({"b": _ClusterKube("b", [_vm("web", ["web-root"], role="primary")]), "a": _ClusterKube("a", [old])},
+                     {"backend": "recorder"}, log=lambda *_: None)
+    rep.sync_metadata = lambda *a, **k: []
+    with pytest.raises(ReplicationError, match="run harvey reprotect first"):
+        rep.failover([("prod", "web", 0, 0)], "b", "a")
+    assert _Recorder.calls == []
+    del REGISTRY["recorder"]
+
+
+def test_reprotect_resumes_after_an_interrupted_run_removed_the_replica_vm():
+    # Longhorn's reprotect releases the replica VM before it replaces the disks; if the run stops there, a re-run
+    # must not refuse with "not found" but recreate the VM after the disks
+    class Reprotecting(_Recorder):
+        def reprotect(self, new_src, new_dst, ns, vm, claims, wait_init):
+            self.calls.append(("reprotect", vm, tuple(claims)))
+            return []
+    REGISTRY["recorder"] = Reprotecting
+    Reprotecting.calls = []
+    new_dst = _ClusterKube("a")                                  # the replica VM is gone
+    rep = Replicator({"b": _ClusterKube("b", [_vm("web", ["web-root"], role="primary")]), "a": new_dst},
+                     {"backend": "recorder"}, log=lambda *_: None)
+    recreated = []
+
+    def sync_metadata(ns, vm_name, src, dst, **k):
+        recreated.append((ns, vm_name, src, dst))
+        new_dst.create("vm", ns, copy.deepcopy(rep.k[src].get("vm", ns, vm_name)))
+        return ["vm/web created (Halted)"]
+    rep.sync_metadata = sync_metadata
+    out = rep.reprotect("prod", "web", "b", "a")
+    assert Reprotecting.calls == [("reprotect", "web", ("web-root",))]
+    assert recreated == [("prod", "web", "b", "a")] and new_dst.get("vm", "prod", "web")
+    assert any("replica VM missing" in o for o in out)
+    del REGISTRY["recorder"]

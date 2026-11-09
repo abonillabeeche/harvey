@@ -451,6 +451,9 @@ class Replicator:
             dvm = self._get_vm(dst, ns, vm)
             if (dvm["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
                 raise ReplicationError(f"{ns}/{vm} is already primary on {dst}")
+            if (dvm["metadata"].get("annotations") or {}).get(A_REPROTECT):
+                raise ReplicationError(f"{ns}/{vm} on {dst} still holds the copy from before the last failover: run "
+                                       f"harvey reprotect first")
             unit = self.unit(dst, ns, vm)
             unit_of[(ns, vm)] = unit.key
             if unit.key not in units:
@@ -591,7 +594,10 @@ class Replicator:
             vm = self._get_vm(new_src, ns, m)
             if (vm["metadata"].get("labels") or {}).get(L_ROLE) != "primary":
                 raise ReplicationError(f"{ns}/{m} is not primary on {new_src}")
-            dvm = self._get_vm(new_dst, ns, m)
+            dvm = kd.get("vm", ns, m)
+            if dvm is None:   # an interrupted reprotect already released it (Longhorn); recreated below
+                out.append(f"{new_dst}: {m}: replica VM missing, it is recreated after the disks")
+                continue
             if vm_status(dvm) not in ("Stopped", "Halted"):
                 raise ReplicationError(f"{ns}/{m} is {vm_status(dvm)} on {new_dst}; it must be stopped "
                                        f"(its disks will be overwritten)")

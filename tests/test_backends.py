@@ -1,5 +1,6 @@
 import copy
 import datetime
+import time
 
 import pytest
 
@@ -276,9 +277,25 @@ def test_lh_preflight_requires_standby_dr_volume_with_a_restored_backup():
     be2 = LonghornBackend({"b": _lh_dr_cluster(last="")}, {}, {}, print)
     with pytest.raises(ReplicationError, match="has not restored any backup"):
         be2.preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+    # seen in the lab: lastBackup is set as soon as a restore starts; only the engine's lastRestoredBackup proves it finished
+    restoring = _lh_dr_cluster()
+    restoring.objs[("lhengine", "longhorn-system", "pvc-123-e-0")]["status"]["lastRestoredBackup"] = ""
+    with pytest.raises(ReplicationError, match="has not restored any backup"):
+        LonghornBackend({"b": restoring}, {}, {}, print).preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
     be3 = LonghornBackend({"b": _lh_dr_cluster(standby=False)}, {}, {}, print)
     with pytest.raises(ReplicationError, match="not a standby DR volume"):
         be3.preflight("a", "b", "demo", "vm1", ["vm1-root"], src_up=False)
+
+
+def test_lh_wait_initialized_requires_the_engine_restore():
+    a = FakeKube("a", [("pvc", "demo", _pvc("vm1-root", "demo", "pvc-123")),
+                       ("pv", None, {"metadata": {"name": "pvc-123"}, "spec": {"csi": {"volumeHandle": "pvc-123"}}})])
+    b = _lh_dr_cluster()
+    be = LonghornBackend({"a": a, "b": b}, {}, {"transfer": 1}, print)
+    be.wait_initialized("a", "b", "demo", "vm1", ["vm1-root"])
+    b.objs[("lhengine", "longhorn-system", "pvc-123-e-0")]["status"]["lastRestoredBackup"] = ""
+    with pytest.raises(AssertionError, match="would block"):
+        be.wait_initialized("a", "b", "demo", "vm1", ["vm1-root"])
 
 
 def test_lh_promote_activates_and_creates_pv_pvc_from_templates():
@@ -328,3 +345,29 @@ def test_lh_status_does_not_trust_volume_lastbackup_without_the_engine():
     b.objs[("lhengine", "longhorn-system", "pvc-123-e-0")]["status"]["lastRestoredBackup"] = ""
     (row,) = LonghornBackend({"a": a, "b": b}, {}, {}, print).volume_status("a", "b", "demo", "vm1", ["vm1-root"])
     assert row.repl_state == "restore not confirmed" and row.healthy is False
+
+
+def _lh_restored(waited_snap, restored_snap):
+    """DR cluster whose engine restored backup-new while the caller waits for backup-old."""
+    b = _lh_dr_cluster(last="backup-new", snap_time=restored_snap)
+    b.create("lhbackup", "longhorn-system",
+             {"metadata": {"name": "backup-old", "namespace": "longhorn-system"},
+              "status": {"snapshotCreatedAt": waited_snap} if waited_snap else {}})
+    return b
+
+
+def test_lh_wait_restored_accepts_a_newer_backup_of_the_volume(monkeypatch):
+    # a recurring backup taken during a long full restore moves the DR volume past the waited backup
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    b = _lh_restored("2026-11-09T15:15:00Z", "2026-11-09T15:35:16Z")
+    be = LonghornBackend({"b": b}, {}, {"transfer": 1}, print)
+    assert be.wait_restored("b", "pvc-123", "backup-old")["metadata"]["name"] == "pvc-123"
+
+
+@pytest.mark.parametrize("waited, restored", [("2026-11-09T15:35:16Z", "2026-11-09T15:15:00Z"),   # older
+                                              (None, "2026-11-09T15:35:16Z")])                   # time unknown
+def test_lh_wait_restored_keeps_waiting_for_older_or_undated_backups(monkeypatch, waited, restored):
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    be = LonghornBackend({"b": _lh_restored(waited, restored)}, {}, {"transfer": 1}, print)
+    with pytest.raises(ReplicationError, match="did not restore backup backup-old"):
+        be.wait_restored("b", "pvc-123", "backup-old")

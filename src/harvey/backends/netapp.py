@@ -180,7 +180,7 @@ class NetAppBackend(StorageBackend):
                     try:
                         ontap.abort(rel["uuid"], cur["uuid"])
                         time.sleep(10)
-                        ontap.set_state(rel["uuid"], "snapmirrored")   # = initialize / resume from checkpoint
+                        ontap.set_state(rel["uuid"], "snapmirrored", wait=False)   # = initialize / resume from checkpoint
                     except OntapError as e:
                         self.log(f"  [yellow]{claim}: restart failed: {e}[/yellow]")
                     last, since = None, time.time()
@@ -235,7 +235,8 @@ class NetAppBackend(StorageBackend):
     def preflight(self, src: str, dst: str, ns: str, vm: str, claims: List[str], src_up: bool):
         for c in claims:
             st = tmr_condition(self.k[dst].get("tmr", ns, c)).get("state")
-            if st not in ("established", "reestablished"):
+            # promoted = an earlier failover stopped half-way (the orchestrator refuses a dst that is primary or needs reprotect)
+            if st not in ("established", "reestablished", "promoted"):
                 raise ReplicationError(f"{dst}: tmr {ns}/{c} is '{st}', expected established — is {ns}/{vm} "
                                        f"protected in the {src} -> {dst} direction?")
 
@@ -391,6 +392,13 @@ class NetAppBackend(StorageBackend):
                     dst_c.get("remoteVolumeHandle") == src_c["localVolumeHandle"]:
                 out.append(f"{new_dst}: tmr/{c} already {dst_c['state']}")
                 continue
+            if t["spec"].get("state") == "reestablished" and dst_c.get("state") != "reestablishing":
+                # Trident only reconciles on a spec change: re-sending the same failed spec would do nothing, so step
+                # through promoted (the volume is not mirrored at this point) and ask again
+                kd.merge_patch("tmr", ns, c, {"spec": {"state": "promoted"}})
+                self._wait_tmr(new_dst, ns, c, ("promoted",), need_handle=False)
+                out.append(f"{new_dst}: tmr/{c} was {dst_c.get('state')}: retrying the reestablish")
+                t = kd.get("tmr", ns, c)
             vmap = t["spec"]["volumeMappings"][0]
             vmap["remoteVolumeHandle"] = src_c["localVolumeHandle"]
             patch = {"spec": {"state": "reestablished", "volumeMappings": [vmap]}}

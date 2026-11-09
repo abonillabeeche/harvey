@@ -181,8 +181,7 @@ class LonghornBackend(StorageBackend):
                     pass
                 last_sync = time.time()
             v = k.get("lhvolume", NS, volume) or {}
-            st = v.get("status") or {}
-            if st.get("lastBackup") == backup and self._engine_restored(dst, volume) == backup:
+            if self._restored_at_least(dst, volume, backup):
                 return v
             time.sleep(5)
         raise ReplicationError(f"{dst}: DR volume {volume} did not restore backup {backup} within "
@@ -223,6 +222,16 @@ class LonghornBackend(StorageBackend):
             time.sleep(3)
         raise ReplicationError(f"{dst}: backup {backup} not visible through BackupTarget '{self.target}' after "
                                f"{self.timeouts['transfer']}s")
+
+    def _restored_at_least(self, cluster: str, volume: str, backup: str) -> bool:
+        """The engine restored `backup`, or a newer backup of the same volume (it contains `backup`'s point): the
+        new primary's recurring job keeps backing up while a long full restore runs, and the DR volume moves on
+        to the newest backup. Without both snapshot times, only `backup` itself counts."""
+        restored = self._engine_restored(cluster, volume)
+        if restored == backup:
+            return True
+        t_restored, t_backup = self._backup_time(cluster, restored), self._backup_time(cluster, backup)
+        return bool(restored and t_restored and t_backup and t_restored >= t_backup)
 
     def _engine_restored(self, cluster: str, volume: str) -> Optional[str]:
         """The backup the volume's engine reports as restored. The volume's status.lastBackup only says which
@@ -360,19 +369,17 @@ class LonghornBackend(StorageBackend):
             out.append(f"{dst}: DR volume {v} created from {b['metadata']['name']} "
                        f"({(b.get('status') or {}).get('size', '?')} B)")
         for c, v in vols.items():
-            st = (kd.get("lhvolume", NS, v) or {}).get("status") or {}
-            if not st.get("lastBackup"):
+            if not self._engine_restored(dst, v):
                 self.log(f"  waiting for {v} to finish its first restore on {dst} ...")
-                kd.wait_for(lambda: ((kd.get("lhvolume", NS, v) or {}).get("status") or {}).get("lastBackup"),
-                            self.timeouts["transfer"], interval=5, what=f"first restore of {v}")
+                kd.wait_for(lambda: self._engine_restored(dst, v), self.timeouts["transfer"], interval=5,
+                            what=f"first restore of {v}")
         return out
 
     def wait_initialized(self, src: str, dst: str, ns: str, vm: str, claims: List[str]):
         for c in claims:
             v = self._volume_name(src, ns, c)
-            kd = self.k[dst]
-            kd.wait_for(lambda: ((kd.get("lhvolume", NS, v) or {}).get("status") or {}).get("lastBackup"),
-                        self.timeouts["transfer"], interval=5, what=f"first restore of {v}")
+            self.k[dst].wait_for(lambda: self._engine_restored(dst, v), self.timeouts["transfer"], interval=5,
+                                 what=f"first restore of {v}")
 
     # ── status ───────────────────────────────────────────────────────────────
     def volume_status(self, primary: str, replica: str, ns: str, vm: str, claims: List[str]) -> List[VolumeStatus]:
@@ -432,7 +439,9 @@ class LonghornBackend(StorageBackend):
             st = (kd.get("lhvolume", NS, v) or {}).get("status") or {}
             if not st.get("isStandby"):
                 raise ReplicationError(f"{dst}: Longhorn volume {v} is not a standby DR volume")
-            if not st.get("lastBackup"):
+            # status.lastBackup is set when a restore starts; only the engine proves one finished (seen in the lab:
+            # lastBackup set while the first 10 GiB restore was at 52%)
+            if not self._engine_restored(dst, v):
                 raise ReplicationError(f"{dst}: DR volume {v} has not restored any backup yet")
 
     def final_sync(self, src: str, dst: str, ns: str, vm: str, claims: List[str],
