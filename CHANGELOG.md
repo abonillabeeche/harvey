@@ -34,6 +34,8 @@ Pluggable storage backends and Portworx async DR.
   `replication.policy` / `schedule`) still work
 - `health-check` and `replication status` ignore VMs protected towards a third cluster
 - Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
+- `failover vm -n`, `failover namespace`, `failback` and `status -n` list VMs only in the given namespace (a
+  namespace-scoped identity got HTTP 403 from the cluster-wide list)
 
 ### Fixed
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and

@@ -424,10 +424,11 @@ def _extract_labels(vm: dict) -> Tuple[int, int]:
     return priority, startup_delay
 
 
-def _fetch_vm_maps(client_source: HarvesterClient, client_dest: HarvesterClient):
+def _fetch_vm_maps(client_source: HarvesterClient, client_dest: HarvesterClient, namespace: Optional[str] = None):
+    """namespace: list only there (namespace-scoped users can't list VMs cluster-wide)."""
     with console.status("[cyan]Fetching VM inventory from both clusters...[/cyan]"):
-        src_data = client_source.get_vms()
-        dst_data = client_dest.get_vms()
+        src_data = client_source.get_vms(namespace)
+        dst_data = client_dest.get_vms(namespace)
     if not src_data or not dst_data:
         console.print("[red]Failed to retrieve VM data from one or both clusters.[/red]")
         return None, None
@@ -905,8 +906,8 @@ def vm_status(
     client1, client2 = get_clients(config, cluster1, cluster2)
 
     with console.status("[cyan]Fetching VM inventory...[/cyan]"):
-        d1 = client1.get_vms()
-        d2 = client2.get_vms()
+        d1 = client1.get_vms(namespace)
+        d2 = client2.get_vms(namespace)
 
     if not d1 or not d2:
         console.print("[red]Could not retrieve VM data from one or both clusters.[/red]")
@@ -1408,7 +1409,7 @@ def failback(
                 groups[(p, r)].append(m)
     for (p, r), vms in groups.items():
         cs, cd = make_client(config, p), make_client(config, r)
-        vms_src, vms_dst = _fetch_vm_maps(cs, cd)
+        vms_src, vms_dst = _fetch_vm_maps(cs, cd, namespace)
         if vms_src is None:
             raise typer.Exit(1)
         plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace, vm_names_filter=vms)
@@ -1458,7 +1459,7 @@ def failover_vms(
         plan = [(ns, v, *_extract_labels(cd.get_vm(ns, v) or {"metadata": {}})) for ns, v, _, _ in plan]
     else:
         cs, cd = get_clients(config, source, destination)
-        vms_src, vms_dst = _fetch_vm_maps(cs, cd)
+        vms_src, vms_dst = _fetch_vm_maps(cs, cd, namespace)
         if vms_src is None:
             raise typer.Exit(1)
         plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace, vm_names_filter=vm_names)
@@ -1477,7 +1478,7 @@ def failover_namespace(
     config = load_config()
     source, destination = resolve_pair(config, source, destination)
     cs, cd = get_clients(config, source, destination)
-    vms_src, vms_dst = _fetch_vm_maps(cs, cd)
+    vms_src, vms_dst = _fetch_vm_maps(cs, cd, namespace)
     if vms_src is None:
         raise typer.Exit(1)
     plan = _build_plan_from_inventory(vms_src, vms_dst, namespace_filter=namespace)
