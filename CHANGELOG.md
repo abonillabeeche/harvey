@@ -36,6 +36,8 @@ Pluggable storage backends and Portworx async DR.
 - Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
 
 ### Fixed
+- `plan run --test`: Harvester and KubeVirt accept the shadow VM (no copied MACs, no `spec.running` next to
+  `runStrategy`, no `harvey.io/*` labels or `dataVolumeTemplates`); `--yes` skips the confirmation
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and
   under-reported the loss by the transfer time)
 

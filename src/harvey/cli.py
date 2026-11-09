@@ -651,7 +651,8 @@ def _build_shadow_vm_spec(source_vm: dict, target_namespace: str) -> dict:
     vm = copy.deepcopy(source_vm)
     orig_meta = vm.get("metadata", {})
 
-    labels = dict(orig_meta.get("labels", {}))
+    # harvey.io/* labels would make Harvey treat the shadow VM as a replica
+    labels = {k: v for k, v in orig_meta.get("labels", {}).items() if not k.startswith("harvey.io/")}
     labels["harvey-test"]             = "true"
     labels["harvey-source-namespace"] = orig_meta.get("namespace", "")
 
@@ -662,6 +663,7 @@ def _build_shadow_vm_spec(source_vm: dict, target_namespace: str) -> dict:
         "harvesterhci.io/volumeClaimTemplates",
         "kubevirt.io/latest-observed-api-version",
         "kubevirt.io/storage-observed-api-version",
+        "harvey.io/",
     )
     annotations = {
         k: v for k, v in orig_meta.get("annotations", {}).items()
@@ -669,8 +671,16 @@ def _build_shadow_vm_spec(source_vm: dict, target_namespace: str) -> dict:
     }
 
     spec = vm.get("spec", {})
-    # Ensure the VM is created stopped; we start it explicitly via the action API
-    spec["running"] = False
+    # created stopped and started later by _vm_action; `running` and `runStrategy` are mutually exclusive
+    spec.pop("running", None)
+    spec["runStrategy"] = "Halted"
+    spec.pop("dataVolumeTemplates", None)
+    for v in spec["template"]["spec"].get("volumes", []):
+        if "dataVolume" in v:
+            v["persistentVolumeClaim"] = {"claimName": v.pop("dataVolume")["name"]}
+    # Harvester pins the source VM's MACs in its spec; reusing them is rejected ("duplicate mac address")
+    for i in spec["template"]["spec"].get("domain", {}).get("devices", {}).get("interfaces", []):
+        i.pop("macAddress", None)
 
     return {
         "apiVersion": "kubevirt.io/v1",
@@ -691,6 +701,7 @@ def _run_plan_test(
     source: str,
     destination: str,
     protection_groups: list,
+    yes: bool = False,
 ):
     """
     Non-disruptive DR test that mirrors VMware SRM 'Test Recovery':
@@ -702,7 +713,7 @@ def _run_plan_test(
 
     Production VMs on both clusters are never touched.
 
-    Storage caveat: shadow VMs retain original PVC/DataVolume references.
+    Storage caveat: shadow VMs keep the original PVC names.
     If those volumes don't exist on the DR cluster the VM will fail to start,
     which is exactly the kind of gap this test is designed to surface.
     """
@@ -726,7 +737,7 @@ def _run_plan_test(
         border_style="yellow",
     ))
 
-    if not Confirm.ask("Start the DR test?"):
+    if not yes and not Confirm.ask("Start the DR test?"):
         console.print("Aborted.")
         return
 
@@ -1652,7 +1663,7 @@ def plan_run(
         source, destination = destination, source
 
     if test:
-        _run_plan_test(data, source, destination, protection_groups)
+        _run_plan_test(data, source, destination, protection_groups, yes=yes)
         return
 
     # Build flat plan: one tuple per VM across all protection groups
