@@ -118,6 +118,6 @@ def check_shared_disks(vms: Dict[str, dict], unit: Unit, cluster: str):
     others = ", ".join(f"{n} (shares {', '.join(cs)})" for n, cs in sorted(clashes.items()))
     everyone = " ".join(sorted(set(unit.vms) | set(clashes)))
     raise ReplicationError(
-        f"{cluster}: {unit.describe()} shares disks with VMs outside it: {others}. VMs that share a disk must be "
-        f"protected and failed over together, in one recovery group:\n"
+        f"{cluster}: {unit.describe()} shares disks with VMs outside it: {others}. VMs that share a disk need to "
+        f"be protected and failed over together. Please add them to one recovery group:\n"
         f"    harvey group add <name> -n {unit.ns} {everyone}")

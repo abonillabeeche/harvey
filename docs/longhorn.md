@@ -159,6 +159,18 @@ protect's wait for the first restore and the failover preflight require the engi
 the lab, `lastBackup` moved on while the engine never restored anything (see the V2 section below), and the
 volume shows `restore not confirmed` instead of `up to date`.
 
+When Harvey waits for a specific backup (final sync, reprotect), it accepts that backup **or a newer one** of the
+same volume, ordered by snapshot time. A DR volume always follows the newest backup on the target, so a scheduled
+backup that lands during the wait is restored instead of Harvey's, and an exact-match check would wait forever.
+
+### Why reprotect replaces the old copy
+
+Longhorn can create a DR volume only from a backup. It can't turn an existing volume into a DR volume or apply
+just the changes in reverse, so reprotect deletes the old primary's stale copy and restores the new primary's
+data in full. Nothing is lost by deleting it: every backup of the old primary, up to the final failover backup,
+stays on the backup target. Only the new primary's *upload* is incremental (same backup volume, changed blocks
+only); the *download* onto the old primary is a full restore. Plan time and bandwidth for it.
+
 ### Storage classes
 
 The PV is recreated with the source's `storageClassName`. Because Harvey creates a static PV, that class doesn't
@@ -174,7 +186,7 @@ have to exist on the DR cluster. Keep the same class names on both sites anyway,
 | **planned failover** | stop the VM → snapshot + backup of each volume (Longhorn attaches a stopped volume for this) → wait until each DR volume has restored that exact backup → activate → create the PV and PVC → start. RPO 0 |
 | **unplanned failover** | activate with whatever the DR volume restored last. The RPO is the age of that backup's snapshot, and the DR cluster knows it without the source |
 | **fencing** | an activated DR volume stops restoring, so a source that comes back can't overwrite it. When the source is reachable, Harvey also stops its scheduled backups |
-| **reprotect** | point the new primary's volumes at the target, back them up, delete the old primary's PVC, PV and volume, recreate it as a DR volume of the new primary (a **full** restore), wait for the restore |
+| **reprotect** | back up the new primary's volumes to the target, delete the old primary's PVC, PV and volume, recreate it as a DR volume of the new primary (a **full** restore), wait for the restore, and only then schedule the new primary's recurring backups. A reprotect that stopped half way reuses the DR volumes it already created |
 
 ## Measured in the lab
 
@@ -191,7 +203,7 @@ timestamps were written to both disks every 5 seconds.
 | failback (planned failover back + reprotect) | **RTO 93 s, RPO 0**. Guest history across both moves: only the two outage gaps |
 | unplanned failover (source unreachable) | **31 s** to Running. Reported RPO ≤ 180 s; real loss 151–156 s. The two disks were a few seconds apart |
 | reprotect after the unplanned failover | the stale primary was demoted, disks replaced, replication running again |
-| recovery group: 2 VMs + 1 standalone PVC | protect, planned failover naming one member (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
+| recovery group: 2 VMs + 1 standalone PVC | protect, planned failover of the group (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
 
 ## V2 data engine: lab findings (alpha)
 

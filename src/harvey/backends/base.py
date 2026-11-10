@@ -53,8 +53,8 @@ class StorageBackend:
             pv = k.get("pv", None, pvc["spec"]["volumeName"]) if pvc["spec"].get("volumeName") else None
             drv = ((pv or {}).get("spec", {}).get("csi") or {}).get("driver")
             if drv not in self.drivers:
-                raise ReplicationError(f"{cluster}: PVC {ns}/{c} is on '{drv}', not {'/'.join(self.drivers)} — "
-                                       f"{self.engine} cannot replicate it")
+                raise ReplicationError(f"{cluster}: PVC {ns}/{c} uses the '{drv}' CSI driver, which {self.engine} can't "
+                                       f"replicate (supported: {'/'.join(self.drivers)}).")
             out[c] = pvc
         return out
 

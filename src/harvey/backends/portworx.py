@@ -154,10 +154,10 @@ class PortworxBackend(StorageBackend):
         cp = self.k[cluster].get("clusterpair", pns, pair)
         if cp is None:
             raise ReplicationError(
-                f"{cluster}: ClusterPair {pns}/{pair} not found. Create it once per direction, e.g.\n"
+                f"{cluster}: ClusterPair {pns}/{pair} not found. Please create it once per direction, for example:\n"
                 f"    storkctl create clusterpair {pair} -n {pns} --src-kube-file <{cluster}.yaml> "
                 f"--dest-kube-file <peer.yaml> --provider s3 --s3-endpoint ... --unidirectional\n"
-                f"  or set replication.portworx.pairs in the Harvey config.")
+                f"  or set replication.portworx.pairs in the Harvey configuration.")
         st = cp.get("status") or {}
         if st.get("schedulerStatus") != "Ready" or st.get("storageStatus") != "Ready":
             raise ReplicationError(f"{cluster}: ClusterPair {pns}/{pair} is not Ready "
@@ -326,8 +326,8 @@ class PortworxBackend(StorageBackend):
         for c in claims:
             d = kd.get("pvc", ns, c)
             if d is not None and (d["metadata"].get("annotations") or {}).get(A_MIGRATED) != "true":
-                raise ReplicationError(f"{dst}: PVC {ns}/{c} already exists and is not a Stork-migrated copy; "
-                                       f"refusing to overwrite it")
+                raise ReplicationError(f"{dst}: PVC {ns}/{c} already exists and isn't a Stork-migrated copy, so Harvey "
+                                       f"won't overwrite it. Please check what created it.")
         out = []
         self.label_volumes(src, ns, vm, claims)
         out.append(f"{src}: labelled {len(claims)} PVC(s)+PV(s) {L_UNIT}={vm}")
@@ -345,8 +345,8 @@ class PortworxBackend(StorageBackend):
             out.append(f"{dst}: pvc/{c} migrated ({sizes.get(c, 0)} B)")
         missing = [c for c in claims if kd.get("pvc", ns, c) is None]
         if missing:
-            raise ReplicationError(f"{dst}: migration finished but PVC(s) {missing} are missing — are their PVs "
-                                   f"labelled {L_UNIT}={vm} and Bound on {src}?")
+            raise ReplicationError(f"{dst}: the migration finished, but PVC(s) {missing} are missing. Please check "
+                                   f"that their PVs are labeled {L_UNIT}={vm} and Bound on {src}.")
         return out
 
     def wait_initialized(self, src: str, dst: str, ns: str, vm: str, claims: List[str]):
@@ -411,7 +411,7 @@ class PortworxBackend(StorageBackend):
         for c in claims:
             p = kd.get("pvc", ns, c)
             if p is None:
-                raise ReplicationError(f"{dst}: replica PVC {ns}/{c} missing — has the first migration finished?")
+                raise ReplicationError(f"{dst}: replica PVC {ns}/{c} not found. Has the first migration finished?")
             if (p["metadata"].get("annotations") or {}).get(A_MIGRATED) != "true":
                 raise ReplicationError(f"{dst}: PVC {ns}/{c} is not a Stork-migrated replica")
             if (p.get("status") or {}).get("phase") != "Bound":
@@ -419,8 +419,8 @@ class PortworxBackend(StorageBackend):
         if src_up:
             pns, _, sched = self._sched(src, dst, ns, vm)
             if self.k[src].get("migrationschedule", pns, sched) is None:
-                raise ReplicationError(f"{src}: no MigrationSchedule {pns}/{sched} — is {ns}/{vm} protected in "
-                                       f"the {src} -> {dst} direction?")
+                raise ReplicationError(f"{src}: MigrationSchedule {pns}/{sched} not found. Is {ns}/{vm} protected from "
+                                       f"{src} to {dst}?")
 
     def final_sync(self, src: str, dst: str, ns: str, vm: str, claims: List[str],
                    not_before: datetime.datetime) -> List[Tuple[str, int, float]]:
@@ -471,8 +471,8 @@ class PortworxBackend(StorageBackend):
         # fence: mark the app active on dst. Stork's autoSuspend on the old source suspends its schedule instead of
         # migrating over the promoted volumes when that site comes back.
         if not self.set_activated(dst, pns, sched, True, suspend=True):
-            self.log(f"  [yellow]{dst}: no Stork copy of {pns}/{sched}; the old source is not fenced — suspend or "
-                     f"delete that schedule before {src} comes back (harvey reprotect does it)[/yellow]")
+            self.log(f"  [yellow]{dst}: no Stork copy of {pns}/{sched}, so the old source isn't fenced. Please suspend "
+                     f"or delete that schedule before {src} comes back (harvey reprotect does this).[/yellow]")
         stamp = iso(now_utc())
         for c in claims:
             p = kd.get("pvc", ns, c)
@@ -480,8 +480,8 @@ class PortworxBackend(StorageBackend):
                 raise ReplicationError(f"{dst}: PVC {ns}/{c} not Bound")
             kd.merge_patch("pvc", ns, c, {"metadata": {"annotations": {A_PROMOTED: stamp}}})
         if not src_up:
-            self.log(f"  [yellow]{src} unreachable: its schedule {pns}/{sched} is still enabled there; with "
-                     f"autoSuspend it suspends itself when it sees {dst} active. Run harvey reprotect once "
+            self.log(f"  [yellow]{src} isn't reachable: its schedule {pns}/{sched} is still enabled there; with "
+                     f"autoSuspend it suspends itself when it sees {dst} active. Please run harvey reprotect once "
                      f"{src} is back.[/yellow]")
 
     # ── reprotect / unprotect ────────────────────────────────────────────────

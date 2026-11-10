@@ -20,7 +20,7 @@ def test_preflight_accepts_a_half_promoted_failover_so_it_can_be_resumed():
     be = NetAppBackend({"b": dst}, {}, TIMEOUTS, log=print)
     be.preflight("a", "b", "demo", "vm1", ["vm1-root", "vm1-data"], src_up=False)
     dst.objs[("tmr", "demo", "vm1-data")] = _tmr("vm1-data", "reestablishing")
-    with pytest.raises(ReplicationError, match="expected established"):
+    with pytest.raises(ReplicationError, match="instead of established"):
         be.preflight("a", "b", "demo", "vm1", ["vm1-root", "vm1-data"], src_up=False)
 
 
