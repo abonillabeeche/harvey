@@ -202,7 +202,7 @@ timestamps were written to both disks every 5 seconds.
 | failback (planned failover back + reprotect) | **RTO 93 s, RPO 0**. Guest history across both moves: only the two outage gaps |
 | unplanned failover (source unreachable) | **31 s** to Running. Reported RPO ≤ 180 s; real loss 151–156 s. The two disks were a few seconds apart |
 | reprotect after the unplanned failover | the stale primary was demoted, disks replaced, replication running again |
-| recovery group: 2 VMs + 1 standalone PVC | protect, planned failover naming one member (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
+| recovery group: 2 VMs + 1 standalone PVC | protect, planned failover of the group (RTO 151 s, RPO 0), reprotect, failback (RTO 144 s, RPO 0) |
 
 ## V2 data engine: lab findings (alpha)
 

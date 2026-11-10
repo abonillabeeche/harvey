@@ -152,3 +152,33 @@ def test_reprotect_resumes_when_the_old_primary_vm_object_is_gone():
     assert synced == [("app", "b", "a")]
     assert any("no VM object" in line for line in out)
     del REGISTRY["recorder"]
+
+
+# ── a named VM never expands to its whole recovery group ─────────────────────
+import typer as _typer
+
+from harvey import cli as _cli
+
+
+def _rep_with_group():
+    k = _ClusterKube("a", [_vm("db", ["db-root"], "stack"), _vm("web", ["web-root"], "stack"), _vm("solo", ["s-root"])])
+    return Replicator({"a": k}, {}, log=lambda *_: None)
+
+
+def test_naming_a_group_member_is_refused_with_the_explicit_group_hint(capsys):
+    with pytest.raises(_typer.Exit):
+        _cli._units_to_run(_rep_with_group(), ["a"], "prod", ["db"], None, "reprotect")
+    out = capsys.readouterr().out
+    assert "db is in recovery group prod/stack" in out and "harvey reprotect -n prod --group stack" in out
+
+
+def test_failover_vm_hint_names_the_group_command(capsys):
+    with pytest.raises(_typer.Exit):
+        _cli._refuse_implicit_groups(_rep_with_group(), ["a"], "prod", ["web"], "harvey failover group {group} -n {ns}")
+    assert "harvey failover group stack -n prod" in capsys.readouterr().out
+
+
+def test_ungrouped_vms_and_explicit_groups_still_run():
+    rep = _rep_with_group()
+    assert _cli._units_to_run(rep, ["a"], "prod", ["solo"], None, "protect") == [("prod/solo", "solo", None)]
+    assert _cli._units_to_run(rep, ["a"], "prod", None, "stack", "protect") == [("prod/stack (recovery group)", None, "stack")]

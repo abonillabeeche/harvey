@@ -1130,37 +1130,48 @@ def _pair_for_vm(rep: Replicator, ns: str, vm: str, a: str, b: str) -> Tuple[str
 GroupOpt = Annotated[Optional[str], typer.Option("--group", "-g", help="Recovery group instead of VM names.")]
 
 
+def _refuse_implicit_groups(rep: Replicator, cluster_candidates: List[str], ns: str, vm_names: Optional[List[str]],
+                            hint: str):
+    """Never act on a whole recovery group because one of its VMs was named: with --yes that could silently stop
+    and move dozens of VMs. If a named VM is in a group, stop and tell the operator to name the group.
+    `hint` is the command to suggest, with {group} and {ns} placeholders."""
+    found: dict = {}
+    for vm in vm_names or []:
+        for c in cluster_candidates:
+            try:
+                unit = rep.unit(c, ns, vm)
+            except ReplicationError as e:
+                if "shares disks" in str(e):
+                    console.print(f"[bold red]✗ {e}[/bold red]")
+                    raise typer.Exit(1)
+                continue
+            except KubeError:
+                continue
+            if unit.group:
+                found.setdefault(unit.group, (unit, []))[1].append(vm)
+            break
+    if not found:
+        return
+    for g, (unit, named) in found.items():
+        extra = f"; standalone PVCs: {', '.join(unit.standalone)}" if unit.standalone else ""
+        console.print(f"[bold red]✗ {', '.join(named)} {'is' if len(named) == 1 else 'are'} in recovery group "
+                      f"{ns}/{g} (VMs: {', '.join(unit.vms)}{extra}).[/bold red]", soft_wrap=True)
+        console.print("  A recovery group is handled as a whole, so name the group explicitly:")
+        console.print(f"    [bold]{hint.format(group=g, ns=ns)}[/bold]", soft_wrap=True)
+    raise typer.Exit(1)
+
+
 def _units_to_run(rep: Replicator, cluster_candidates: List[str], ns: str, vm_names: Optional[List[str]],
-                  group: Optional[str]) -> List[Tuple[str, Optional[str], Optional[str]]]:
-    """[(label, vm, group)] with one entry per protection unit: a named group, or each VM (a VM in a recovery
-    group stands for its whole group, listed once)."""
+                  group: Optional[str], cmd: str) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    """[(label, vm, group)] with one entry per protection unit: the named group, or each named VM. A named VM
+    that belongs to a recovery group is refused (the group must be named with --group)."""
     if not vm_names and not group:
         console.print("[bold red]Give VM name(s) or --group.[/bold red]")
         raise typer.Exit(1)
     if group:
         return [(f"{ns}/{group} (recovery group)", None, group)]
-    out, seen = [], set()
-    for vm in vm_names:
-        unit = None
-        for c in cluster_candidates:
-            try:
-                unit = rep.unit(c, ns, vm)
-                break
-            except ReplicationError as e:
-                if "shares disks" in str(e):
-                    console.print(f"[bold red]✗ {e}[/bold red]")
-                    raise typer.Exit(1)
-            except KubeError:
-                continue
-        key = unit.key if unit else (ns, vm)
-        if key in seen:
-            continue
-        seen.add(key)
-        if unit and unit.group:
-            out.append((f"{ns}/{unit.group} (recovery group: {', '.join(unit.vms)})", None, unit.group))
-        else:
-            out.append((f"{ns}/{vm}", vm, None))
-    return out
+    _refuse_implicit_groups(rep, cluster_candidates, ns, vm_names, f"harvey {cmd} -n {{ns}} --group {{group}}")
+    return [(f"{ns}/{vm}", vm, None) for vm in dict.fromkeys(vm_names)]
 
 
 def _pair_for_unit(rep: Replicator, ns: str, vm: Optional[str], group: Optional[str], a: str, b: str):
@@ -1196,7 +1207,7 @@ def protect(
     source, destination = resolve_pair(config, source, destination)
     rep = make_replicator(config, [source, destination])
     rc = 0
-    for label, vm, grp in _units_to_run(rep, [source], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [source], namespace, vm_names, group, "protect"):
         console.rule(f"[bold]protect {label}: {source} → {destination}[/bold]")
         try:
             for line in rep.protect(namespace, vm, source, destination, wait_init=wait, group=grp):
@@ -1226,7 +1237,7 @@ def unprotect(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
-    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group, "unprotect"):
         p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
         what = "and DELETE the replica VM(s) + volumes " if delete_replica else ""
         if not yes and not Confirm.ask(f"Stop replicating {label} ({p} → {r}) {what}?"):
@@ -1367,7 +1378,7 @@ def reprotect(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
-    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group, "reprotect"):
         p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
         if not yes and not Confirm.ask(f"Reverse-resync {label}: {p} → {r} (overwrites {r}'s disks)?"):
             continue
@@ -1384,8 +1395,9 @@ def reprotect(
 # ── failback ──────────────────────────────────────────────────────────────────
 @app.command("failback")
 def failback(
-    vm_names: Annotated[List[str], typer.Argument(help="VM name(s) to return to their original site.")],
-    namespace: NsOpt,
+    vm_names: Annotated[Optional[List[str]], typer.Argument(help="VM name(s) to return to their original site.")] = None,
+    namespace: NsOpt = ...,
+    group: GroupOpt = None,
     source: SourceOpt = None,
     destination: DestOpt = None,
     no_reprotect: Annotated[bool, typer.Option("--no-reprotect", help="Do not re-establish replication "
@@ -1400,12 +1412,19 @@ def failback(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
+    if not vm_names and not group:
+        console.print("[bold red]Give VM name(s) or --group.[/bold red]")
+        raise typer.Exit(1)
     groups: dict = {}
-    for vm in vm_names:
-        p, r = _pair_for_vm(rep, namespace, vm, a, b)
-        for m in rep.unit(p, namespace, vm).vms:      # a recovery group goes back as a whole
-            if m not in groups.setdefault((p, r), []):
-                groups[(p, r)].append(m)
+    if group:
+        p, r = _pair_for_unit(rep, namespace, None, group, a, b)
+        groups[(p, r)] = list(rep.unit(p, namespace, group=group).vms)
+    else:
+        _refuse_implicit_groups(rep, [a, b], namespace, vm_names, "harvey failback -n {ns} --group {group}")
+        for vm in vm_names:
+            p, r = _pair_for_vm(rep, namespace, vm, a, b)
+            if vm not in groups.setdefault((p, r), []):
+                groups[(p, r)].append(vm)
     for (p, r), vms in groups.items():
         cs, cd = make_client(config, p), make_client(config, r)
         vms_src, vms_dst = _fetch_vm_maps(cs, cd)
@@ -1452,6 +1471,9 @@ def failover_vms(
     """Fails over specific protected VMs (stop → final sync → promote → start)."""
     config = load_config()
     source, destination = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [destination] if unplanned else [source, destination])
+    _refuse_implicit_groups(rep, [destination] if unplanned else [source, destination], namespace, vm_names,
+                            "harvey failover group {group} -n {ns}")
     if unplanned:
         plan = [(namespace, v, 0, 0) for v in vm_names]  # source may be unreachable: trust the replica side
         cd = make_client(config, destination)

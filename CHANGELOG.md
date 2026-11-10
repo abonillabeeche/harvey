@@ -36,6 +36,10 @@ Pluggable storage backends and Portworx async DR.
 - Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
 
 ### Fixed
+- **Naming one VM of a recovery group no longer acts on the whole group.** `failover vm`, `failback`, `protect`,
+  `reprotect` and `unprotect` used to add the other members silently, so with `--yes` one VM name could stop
+  and move a large group. They now refuse, list the group's VMs and standalone PVCs, and print the exact
+  `--group` / `failover group` command. `failback` gained `--group`.
 - **Longhorn reprotect could wait forever**: it scheduled the new primary's recurring backups first, and the
   waits required the DR volume to restore exactly Harvey's backup. A scheduled backup that landed during the
   (full) restore was restored instead, so the wait never matched and reprotect timed out half way. Waits now
