@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 
 import typer
 import yaml
+from rich.markup import escape
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -506,7 +507,7 @@ def _execute_failover_plan(
     try:
         r = rep.failover(plan, source, destination, unplanned=unplanned, force=force, hooks_cb=hook_cb)
     except ERRORS as e:
-        console.print(f"\n[bold red]Failover aborted: {e}[/bold red]")
+        console.print(f"\n[bold red]Failover stopped: {escape(str(e))}[/bold red]", soft_wrap=True)
         _audit("failover_aborted", {"source": source, "destination": destination, "error": str(e)})
         return {**empty, "failed": [("-", "preflight", str(e))]}
     return {"stopped": r.stopped, "started": r.started, "failed": r.failed, "rto_seconds": r.rto_seconds,
@@ -534,7 +535,8 @@ def _print_failover_summary(result: dict):
                   "0s (lossless)" if rpo == 0 else ("unknown" if rpo is None else f"≤ {rpo}s"))
     console.print(t)
     for vm, phase, err in result["failed"]:
-        console.print(f"  [red]• {vm} [{phase}]: {err}[/red]")
+        who = "" if vm in (None, "", "-") else f"{escape(str(vm))} "
+        console.print(f"  [red]• {who}({escape(str(phase))}): {escape(str(err))}[/red]", soft_wrap=True)
 
 
 
@@ -630,9 +632,12 @@ def _ad_hoc_failover(
         "rto_seconds": result.get("rto_seconds"), "rpo": result.get("rpo"), "phases": result.get("phases"),
     })
     if result["started"] and hint:
-        console.print(f"\nNext: once {source} is healthy, run "
+        console.print(f"\nNext: once {source} is healthy, please run "
                       f"[bold cyan]harvey reprotect -n <ns> <vm>[/bold cyan] to replicate back "
                       f"({destination} → {source}).")
+    if result["failed"]:
+        # a non-zero exit lets scripts (and failback, which reprotects next) notice the failure
+        raise typer.Exit(1)
 
 
 
@@ -904,6 +909,24 @@ def config_show():
 
 
 # ── status ────────────────────────────────────────────────────────────────────
+def _dr_state(vm1: Optional[dict], vm2: Optional[dict]) -> Tuple[str, str, str]:
+    """(text, style, kind) of the DR State column for one VM seen on both clusters.
+    kind: standalone | split | synced | reprotect | ready. A stopped copy that still carries
+    harvey.io/needs-reprotect (left by a failover) can't take a failover until it is reprotected."""
+    s1 = vm1.get("status", {}).get("printableStatus", "Unknown") if vm1 else "Not Found"
+    s2 = vm2.get("status", {}).get("printableStatus", "Unknown") if vm2 else "Not Found"
+    if s1 == "Not Found" or s2 == "Not Found":
+        return "Standalone", "[dim]", "standalone"
+    if s1 == "Running" and s2 == "Running":
+        return "❌ SPLIT BRAIN", "[bold white on red]", "split"
+    if s1 == s2:
+        return "✅ Synced", "[green]", "synced"
+    stopped = vm2 if s1 == "Running" else vm1
+    if ((stopped.get("metadata") or {}).get("annotations") or {}).get(A_REPROTECT):
+        return "⚠ Needs reprotect", "[yellow]", "reprotect"
+    return "✅ Ready", "[green]", "ready"
+
+
 @app.command("status")
 def vm_status(
     cluster1: Annotated[str, typer.Argument(help="First cluster name (from config).")],
@@ -947,6 +970,7 @@ def vm_status(
     t.add_column("Priority",   justify="right", style="dim")
 
     split_brain_count = ready_count = 0
+    needs_reprotect: List[str] = []
 
     for ns, name in all_keys:
         vm1 = vms1.get((ns, name))
@@ -957,16 +981,13 @@ def vm_status(
         labels   = (vm1 or vm2).get("metadata", {}).get("labels", {})
         priority = labels.get("failover-priority", "—")
 
-        if s1 == "Not Found" or s2 == "Not Found":
-            state_text, state_style = "Standalone", "[dim]"
-        elif s1 == "Running" and s2 == "Running":
-            state_text, state_style = "❌ SPLIT BRAIN", "[bold white on red]"
+        state_text, state_style, kind = _dr_state(vm1, vm2)
+        if kind == "split":
             split_brain_count += 1
-        elif s1 == s2:
-            state_text, state_style = "✅ Synced", "[green]"
-        else:
-            state_text, state_style = "✅ Ready", "[green]"
+        elif kind == "ready":
             ready_count += 1
+        elif kind == "reprotect":
+            needs_reprotect.append(f"{ns}/{name}")
 
         t.add_row(
             ns, name,
@@ -983,6 +1004,10 @@ def vm_status(
                       f"manually before any other operation.[/bold red]")
     if ready_count:
         console.print(f"[green]{ready_count} VM(s) ready for failover.[/green]")
+    if needs_reprotect:
+        console.print(f"[yellow]{len(needs_reprotect)} VM(s) can't fail over again until they are reprotected: "
+                      f"{', '.join(needs_reprotect)}. Please run harvey reprotect for them (use --group for a "
+                      f"recovery group).[/yellow]", soft_wrap=True)
 
 
 # ── health-check ──────────────────────────────────────────────────────────────
@@ -1015,7 +1040,7 @@ def health_check(
     if not all_ok:
         console.print(Panel("[bold red]✗ Health check failed: Harvey can't reach every cluster.[/bold red]",
                             border_style="red"))
-        return
+        raise typer.Exit(1)
 
     # 2. VM coverage
     d1 = client1.get_vms()
@@ -1101,6 +1126,8 @@ def health_check(
 
     _audit("health_check", {"cluster1": cluster1, "cluster2": cluster2,
                             "common_vms": len(common), "split_brain": len(split_brain), "ok": all_ok})
+    if not all_ok:
+        raise typer.Exit(1)
 
 
 # ── audit ─────────────────────────────────────────────────────────────────────
@@ -1663,8 +1690,8 @@ def plan_run(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Show plan without executing.")] = False,
     test:    Annotated[bool, typer.Option(
         "--test",
-        help="Non-disruptive DR test: clones VMs into shadow namespaces on DR cluster "
-             "and verifies they start. Production VMs are never touched.",
+        help="Non-disruptive DR test (roadmap, not available yet): will boot clones of the replica volumes "
+             "in an isolated namespace.",
     )] = False,
     unplanned: Annotated[bool, typer.Option("--unplanned", help="Source site down: promote + start only.")] = False,
     force: Annotated[bool, typer.Option("--force", help="With --unplanned: ignore VMs still running on source.")] = False,
@@ -1679,8 +1706,15 @@ def plan_run(
     - `--unplanned` — source is down: promote the last replicated data and start (RPO = replication lag).
     - `--reverse` — run it the other way round (failback), after `harvey reprotect`.
     - `--dry-run` — shows the ordered plan with no changes.
-    - `--test`    — non-disruptive shadow DR test (mirrors SRM 'Test Recovery').
+    - `--test`    — roadmap: a non-disruptive DR test with cloned replica volumes (not available yet).
     """
+    if test:
+        console.print("[yellow]DR test mode isn't available yet.[/yellow] A meaningful test needs clones of the "
+                      "replica volumes in an isolated namespace, and that is on the roadmap: without them the test "
+                      "VMs can't boot. Nothing was changed.\n"
+                      f"For now, please use [bold cyan]harvey plan run {name} --dry-run[/bold cyan] to check the plan "
+                      "and [bold cyan]harvey health-check[/bold cyan] to check replication.", soft_wrap=True)
+        raise typer.Exit(1)
     plan_file = PLANS_DIR / f"{name}.yaml"
     if not plan_file.exists():
         console.print(f"[red]Plan '{name}' not found.[/red]")

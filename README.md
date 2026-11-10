@@ -506,7 +506,6 @@ harvey plan run production-dr --dry-run       # show the order, change nothing
 harvey plan run production-dr                 # planned failover with hooks
 harvey plan run production-dr --unplanned     # site down
 harvey plan run production-dr --reverse       # failback, after reprotect
-harvey plan run production-dr --test          # boot test in shadow namespaces
 ```
 
 Hooks get `HARVEY_SOURCE` and `HARVEY_DESTINATION` in their environment.
@@ -559,8 +558,12 @@ backend against an in-memory fake Kubernetes API.
   [docs/portworx.md](docs/portworx.md).
 - **Longhorn is backup based.** Every recovery point is a backup, reprotect is a full restore, and a V1
   disk built on a Harvester backing image only restores where a backing image with the same name exists (Harvester
-  names them after the image UID). The V2 data engine is alpha (untested). Details in [docs/longhorn.md](docs/longhorn.md).
-- **`--test` mode** boots copies of the VM spec in shadow namespaces but does not clone the replica volumes yet.
+  names them after the image UID). V2 DR volumes work (planned failover, reprotect, failback and recovery groups
+  validated on SUSE Virtualization v1.10.0-rc1 with Longhorn 1.13.0); use Longhorn 1.13.1 or later, because earlier
+  versions can fault a V2 DR volume on a backup-store lock (longhorn#14085). Details in [docs/longhorn.md](docs/longhorn.md).
+- **No DR test mode yet.** `harvey plan run --test` is on the roadmap: a useful test needs clones of the replica
+  volumes in an isolated namespace, so for now it only explains that and changes nothing. Use `--dry-run` and
+  `harvey health-check` to check a plan and its replication.
 
 ---
 
@@ -571,13 +574,14 @@ backend against an in-memory fake Kubernetes API.
 - [ ] **Protect a whole namespace**: `harvey protect --all -n production` protects every VM in the namespace,
   and failovers still run in `failover-priority` order (`harvey failover namespace` already orders by priority).
 - [ ] Recovery plans that reference groups instead of listing VMs, and group-level health/lag in `health-check`.
-- [ ] `plan run --test` that boots clones of the replica volumes (FlexClone on NetApp, snapshots on Portworx)
-  in an isolated namespace, not just the VM spec.
+- [ ] **DR test mode** (`plan run --test`): clone the replica volumes (FlexClone on NetApp, snapshots on Portworx,
+  a restored copy on Longhorn) into an isolated namespace, boot the VMs there on an isolated network, report, and
+  clean up. The shadow-VM spec builder already produces a spec that Harvester and KubeVirt accept.
 - [ ] `harvey bench`: repeatable failover/failback measurements (RTO per phase, RPO from an in-guest marker,
   database consistency checks) written to CSV.
-- [ ] Longhorn V2 data engine: protect works; restores stalled in the lab on a host NVMe-TCP hang (details in
-  [docs/longhorn.md](docs/longhorn.md#v2-data-engine-lab-findings-alpha)). Retest on a clean host, then drop the
-  alpha label.
+- [ ] Longhorn V2 data engine: planned failover, reprotect, failback and recovery groups validated with RPO 0 on
+  SUSE Virtualization v1.10.0-rc1 with Longhorn 1.13.0. Still to do: an unplanned failover, and a run on Longhorn
+  1.13.1 (the longhorn#14085 fix); then drop the alpha label.
 - [ ] Longhorn V1: restore a missing backing image on the DR cluster automatically, under its original name,
   from its backing-image backup.
 - [ ] Per-site adjustments at promotion (node affinity, NAD or StorageClass changes) for DR sites that aren't

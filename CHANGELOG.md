@@ -30,6 +30,9 @@ Pluggable storage backends and Portworx async DR.
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
 
 ### Changed
+- **`plan run --test` is a roadmap item.** It booted the VM spec in a shadow namespace without the replica
+  volumes, so the test VMs couldn't start and the test proved little. It now explains that DR test mode isn't
+  available yet and changes nothing. The shadow-VM spec builder stays for the real feature.
 - **Clearer, more courteous messages.** Errors, warnings and hints now say what's wrong and then what to do
   ("Please name the group explicitly", "Please stop it first, because reprotect overwrites its disks"),
   in full sentences, without blunt imperatives or all-caps. The Longhorn V2 warning now recommends Longhorn
@@ -42,6 +45,15 @@ Pluggable storage backends and Portworx async DR.
   namespace-scoped identity got HTTP 403 from the cluster-wide list)
 
 ### Fixed
+- **Failover summaries show the phase of each failure again.** Rich read `[preflight]` as markup and dropped it,
+  and a preflight refusal showed a `-` placeholder instead of a VM (`• - : …`). Failure lines are now escaped and
+  read `• (preflight): …` or `• ns/vm (start): …`.
+- **`harvey status` flags copies that need a reprotect.** A stopped copy left by a failover
+  (`harvey.io/needs-reprotect`) showed as Ready although failover refuses it; it now shows `⚠ Needs reprotect`
+  and status ends with a hint to run `harvey reprotect`.
+- **Failures now exit non-zero.** A failover (or failback) that recorded failures, and a failed
+  `health-check`, exited 0, so scripts couldn't tell. They now exit 1, and failback stops before reprotecting
+  when its failover failed.
 - **Naming one VM of a recovery group no longer acts on the whole group.** `failover vm`, `failback`, `protect`,
   `reprotect` and `unprotect` used to add the other members silently, so with `--yes` one VM name could stop
   and move a large group. They now refuse, list the group's VMs and standalone PVCs, and print the exact

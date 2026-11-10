@@ -91,15 +91,15 @@ def test_shadow_vm_is_halted_and_clean(run):
     assert md["labels"]["app"] == "db" and md["labels"]["harvey-test"] == "true"
 
 
-def test_plan_run_test_yes_does_not_prompt(monkeypatch, tmp_path):
+def test_plan_run_test_is_a_roadmap_item_and_changes_nothing(monkeypatch, tmp_path):
+    """DR test mode needs cloned replica volumes (roadmap): --test explains that, doesn't prompt or touch a cluster."""
     (tmp_path / "p.yaml").write_text("name: p\nsource: a\ndestination: b\nprotection_groups: []\n")
     monkeypatch.setattr(cli, "PLANS_DIR", tmp_path)
-    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: pytest.fail("prompted although --yes was given"))
-    monkeypatch.setattr(cli, "load_config", lambda: {})
-    monkeypatch.setattr(cli, "get_clients", lambda *a: (None, None))
-    monkeypatch.setattr(cli, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: pytest.fail("prompted"))
+    monkeypatch.setattr(cli, "load_config", lambda: pytest.fail("read the config"))
+    monkeypatch.setattr(cli, "get_clients", lambda *a: pytest.fail("connected to a cluster"))
     r = CliRunner().invoke(cli.app, ["plan", "run", "p", "--test", "--yes"])
-    assert r.exit_code == 0, r.output
+    assert r.exit_code == 1 and "isn't available yet" in r.output and "Nothing was changed" in r.output
 
 
 def test_original_run_strategy():
