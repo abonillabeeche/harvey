@@ -30,12 +30,25 @@ Pluggable storage backends and Portworx async DR.
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
 
 ### Changed
+- **Clearer, more courteous messages.** Errors, warnings and hints now say what's wrong and then what to do
+  ("Please name the group explicitly", "Please stop it first, because reprotect overwrites its disks"),
+  in full sentences, without blunt imperatives or all-caps. The Longhorn V2 warning now recommends Longhorn
+  1.13.1 or later instead of calling V2 untested.
 - NetApp logic moved to `backends/netapp.py` without behaviour changes; 0.2 configs (top-level
   `replication.policy` / `schedule`) still work
 - `health-check` and `replication status` ignore VMs protected towards a third cluster
 - Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
 
 ### Fixed
+- **Naming one VM of a recovery group no longer acts on the whole group.** `failover vm`, `failback`, `protect`,
+  `reprotect` and `unprotect` used to add the other members silently, so with `--yes` one VM name could stop
+  and move a large group. They now refuse, list the group's VMs and standalone PVCs, and print the exact
+  `--group` / `failover group` command. `failback` gained `--group`.
+- **Longhorn reprotect could wait forever**: it scheduled the new primary's recurring backups first, and the
+  waits required the DR volume to restore exactly Harvey's backup. A scheduled backup that landed during the
+  (full) restore was restored instead, so the wait never matched and reprotect timed out half way. Waits now
+  accept the requested backup or a newer one, recurring backups start after the restore is confirmed, and a
+  rerun reuses the DR volumes an interrupted reprotect already created.
 - `plan run --test`: Harvester and KubeVirt accept the shadow VM (no copied MACs, no `spec.running` next to
   `runStrategy`, no `harvey.io/*` labels or `dataVolumeTemplates`); `--yes` skips the confirmation
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and

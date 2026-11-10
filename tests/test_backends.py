@@ -100,9 +100,9 @@ def test_detect_backend_rejects_unsupported_and_mixed():
                        ("pvc", "demo", _pvc("d1", "demo", "pv2")), ("pv", None, _pv("pv2", "pxd.portworx.com")),
                        ("pvc", "demo", _pvc("d2", "demo", "pv3")), ("pv", None, _pv("pv3", "csi.trident.netapp.io"))])
     rep = Replicator({"a": k}, {}, log=lambda *_: None)
-    with pytest.raises(ReplicationError, match="no Harvey storage backend"):
+    with pytest.raises(ReplicationError, match="which no Harvey storage backend replicates"):
         rep.detect_backend("a", "demo", _vm(claims=("r",)))
-    with pytest.raises(ReplicationError, match="mixes storage backends"):
+    with pytest.raises(ReplicationError, match="uses more than one storage backend"):
         rep.detect_backend("a", "demo", _vm(claims=("d1", "d2")))
 
 
@@ -328,3 +328,98 @@ def test_lh_status_does_not_trust_volume_lastbackup_without_the_engine():
     b.objs[("lhengine", "longhorn-system", "pvc-123-e-0")]["status"]["lastRestoredBackup"] = ""
     (row,) = LonghornBackend({"a": a, "b": b}, {}, {}, print).volume_status("a", "b", "demo", "vm1", ["vm1-root"])
     assert row.repl_state == "restore not confirmed" and row.healthy is False
+
+
+def _lh_dr_with_backups(restored):
+    """DR cluster whose engine restored `restored`; backup-old (10:00) and backup-new (10:05) are both synced."""
+    b = _lh_dr_cluster(last=restored)
+    for name, t in (("backup-old", "2026-11-07T10:00:00Z"), ("backup-new", "2026-11-07T10:05:00Z")):
+        b.objs[("lhbackup", "longhorn-system", name)] = {"metadata": {"name": name, "namespace": "longhorn-system"},
+                                                        "status": {"snapshotCreatedAt": t}}
+    return b
+
+
+def test_lh_wait_restored_accepts_a_newer_backup_of_the_same_volume():
+    # a scheduled backup landed while we waited and the DR volume restored it instead of ours
+    be = LonghornBackend({"b": _lh_dr_with_backups("backup-new")}, {}, {"transfer": 5}, lambda *_: None)
+    assert be.wait_restored("b", "pvc-123", "backup-old")["metadata"]["name"] == "pvc-123"
+
+
+def test_lh_wait_restored_rejects_an_older_backup(monkeypatch):
+    import harvey.backends.longhorn as lh
+    monkeypatch.setattr(lh.time, "sleep", lambda *_: None)
+    be = LonghornBackend({"b": _lh_dr_with_backups("backup-old")}, {}, {"transfer": 0.2}, lambda *_: None)
+    with pytest.raises(ReplicationError, match="didn't restore backup backup-new"):
+        be.wait_restored("b", "pvc-123", "backup-new")
+
+
+def test_lh_reprotect_reuses_an_existing_dr_volume_and_schedules_backups_last():
+    from harvey.backends.longhorn import A_SRC
+    a = FakeKube("a", [
+        ("pvc", "demo", {"metadata": {"name": "vm1-root", "namespace": "demo"}, "spec": {"volumeName": "pv-1"}}),
+        ("pv", None, {"metadata": {"name": "pv-1"},
+                      "spec": {"csi": {"driver": "driver.longhorn.io", "volumeHandle": "pvc-123"}}}),
+        ("lhvolume", "longhorn-system", {"metadata": {"name": "pvc-123", "labels": {}}, "spec": {}}),
+        ("lhbackuptarget", "longhorn-system", {"metadata": {"name": "harvey"}, "spec": {"backupTargetURL": "s3://x"},
+                                               "status": {"available": True}})])
+    # the old primary already holds a standby DR volume of the new primary (an earlier reprotect stopped half way)
+    b = _lh_dr_with_backups("backup-new")
+    b.objs[("lhvolume", "longhorn-system", "pvc-123")]["metadata"]["annotations"][A_SRC] = "a"
+    b.objs[("lhbackuptarget", "longhorn-system", "harvey")] = a.objs[("lhbackuptarget", "longhorn-system", "harvey")]
+    be = LonghornBackend({"a": a, "b": b}, {}, {"transfer": 5}, lambda *_: None)
+    calls = []
+    be.backup_now = lambda c, v, tag: calls.append(("backup", c)) or {"metadata": {"name": "backup-old"}, "spec": {}}
+    real_wait = be.wait_restored
+    be.wait_restored = lambda c, v, bn: calls.append(("wait", c, bn)) or real_wait(c, v, bn)
+    be._create_dr_volume = lambda *_: calls.append(("create",))
+    out = be.reprotect("a", "b", "demo", "vm1", ["vm1-root"], wait_init=True)
+    assert ("create",) not in calls                                    # reused, not replaced
+    assert b.get("lhvolume", "longhorn-system", "pvc-123") is not None  # the DR volume was kept
+    assert calls == [("backup", "a"), ("wait", "b", "backup-old")]
+    vol = a.get("lhvolume", "longhorn-system", "pvc-123")
+    assert vol["metadata"]["labels"][L_GROUP] == "enabled" and vol["spec"]["backupTargetName"] == "harvey"
+    assert any("reused" in line for line in out) and out[-1].startswith("a: volume pvc-123 → backups")
+
+
+def test_lh_wait_restored_fails_fast_on_a_faulted_dr_volume():
+    b = _lh_dr_with_backups("backup-old")
+    b.objs[("lhvolume", "longhorn-system", "pvc-123")]["status"].update({"robustness": "faulted", "conditions": [
+        {"type": "Restore", "status": "False", "message": "All replica restore failed and the volume became Faulted"}]})
+    be = LonghornBackend({"b": b}, {}, {"transfer": 600}, lambda *_: None)
+    with pytest.raises(ReplicationError, match="is faulted .*All replica restore failed.*longhorn#14085"):
+        be.wait_restored("b", "pvc-123", "backup-new")
+
+
+def test_lh_a_faulted_dr_volume_is_not_reused():
+    from harvey.backends.longhorn import A_SRC
+    b = _lh_dr_with_backups("backup-new")
+    vol = b.objs[("lhvolume", "longhorn-system", "pvc-123")]
+    vol["metadata"]["annotations"][A_SRC] = "a"
+    be = LonghornBackend({"b": b}, {}, {}, lambda *_: None)
+    assert be._is_dr_volume_of("b", "pvc-123", "a") is True
+    vol["status"]["robustness"] = "faulted"
+    assert be._is_dr_volume_of("b", "pvc-123", "a") is False
+
+
+def test_lh_protect_replaces_a_faulted_standby_dr_volume():
+    a = FakeKube("a", [
+        ("pvc", "demo", {"metadata": {"name": "vm1-root", "namespace": "demo"}, "spec": {"volumeName": "pv-1"}}),
+        ("pv", None, {"metadata": {"name": "pv-1"},
+                      "spec": {"csi": {"driver": "driver.longhorn.io", "volumeHandle": "pvc-123"}}}),
+        ("lhvolume", "longhorn-system", {"metadata": {"name": "pvc-123", "labels": {}}, "spec": {}}),
+        ("lhbackuptarget", "longhorn-system", {"metadata": {"name": "harvey"}, "spec": {"backupTargetURL": "s3://x"},
+                                               "status": {"available": True}})])
+    b = _lh_dr_cluster()
+    b.objs[("lhvolume", "longhorn-system", "pvc-123")]["status"]["robustness"] = "faulted"
+    b.objs[("lhbackuptarget", "longhorn-system", "harvey")] = a.objs[("lhbackuptarget", "longhorn-system", "harvey")]
+    be = LonghornBackend({"a": a, "b": b}, {}, {"tmr": 1, "transfer": 1}, lambda *_: None)
+    created = []
+    be.backup_now = lambda c, v, tag: {"metadata": {"name": "backup-new"}, "spec": {}, "status": {"size": "1"}}
+    be.wait_backup_visible = lambda *_: None
+    def fake_create(src, dst, ns, vm, c, v, bk):
+        created.append(v)
+        b.objs[("lhvolume", "longhorn-system", v)] = {"metadata": {"name": v, "labels": {"harvey.io/managed": "true"}},
+                                                     "spec": {"Standby": True}, "status": {"lastBackup": "backup-new"}}
+    be._create_dr_volume = fake_create
+    out = be.protect("a", "b", "demo", "vm1", ["vm1-root"], wait_init=False)
+    assert created == ["pvc-123"] and any("faulted DR volume pvc-123 deleted" in line for line in out)

@@ -68,7 +68,7 @@ class NetAppBackend(StorageBackend):
         k = self.k[cluster]
         pvc = k.get("pvc", ns, claim)
         if not pvc or not pvc["spec"].get("volumeName"):
-            raise ReplicationError(f"{cluster}: PVC {ns}/{claim} not bound")
+            raise ReplicationError(f"{cluster}: PVC {ns}/{claim} isn't bound to a volume yet.")
         tvol = k.get("tvol", "trident", pvc["spec"]["volumeName"])
         if not tvol:
             raise ReplicationError(f"{cluster}: no TridentVolume for {pvc['spec']['volumeName']}")
@@ -117,8 +117,8 @@ class NetAppBackend(StorageBackend):
                                       "spec": {"state": "promoted", "volumeMappings": [{"localPVCName": c}]}})
                 out.append(f"{src}: tmr/{c} created (promoted)")
             elif t["spec"].get("state") != "promoted":
-                raise ReplicationError(f"{src}: tmr/{c} is '{t['spec'].get('state')}' — {src} is not the primary "
-                                       f"for this volume")
+                raise ReplicationError(f"{src}: tmr/{c} is '{t['spec'].get('state')}', so {src} isn't the primary "
+                                       f"for this volume.")
             handles[c] = self._wait_tmr(src, ns, c, ("promoted",))["localVolumeHandle"]
 
         # 2. destination TMRs + PVCs
@@ -236,8 +236,8 @@ class NetAppBackend(StorageBackend):
         for c in claims:
             st = tmr_condition(self.k[dst].get("tmr", ns, c)).get("state")
             if st not in ("established", "reestablished"):
-                raise ReplicationError(f"{dst}: tmr {ns}/{c} is '{st}', expected established — is {ns}/{vm} "
-                                       f"protected in the {src} -> {dst} direction?")
+                raise ReplicationError(f"{dst}: TMR {ns}/{c} is '{st}' instead of established. Is {ns}/{vm} "
+                                       f"protected from {src} to {dst}?")
 
     def final_sync(self, src: str, dst: str, ns: str, vm: str, claims: List[str],
                    not_before: datetime.datetime) -> List[Tuple[str, int, float]]:
@@ -269,14 +269,14 @@ class NetAppBackend(StorageBackend):
                 if cur.get("bytes_transferred") != busy_bytes:
                     busy_bytes, busy_since = cur.get("bytes_transferred"), time.time()
                 elif time.time() - busy_since > stall and cur.get("uuid"):
-                    self.log(f"  [yellow]{claim}: running transfer stalled {stall}s, aborting it[/yellow]")
+                    self.log(f"  [yellow]{claim}: the running transfer stalled for {stall}s; stopping it so Harvey can retry.[/yellow]")
                     try:
                         ontap.abort(rel["uuid"], cur["uuid"])
                     except OntapError:
                         pass
                     busy_since = time.time()
                 if time.time() > deadline:
-                    raise ReplicationError(f"{claim}: a transfer has been running for too long")
+                    raise ReplicationError(f"{claim}: a SnapMirror transfer is still running after the timeout.")
                 time.sleep(3)
                 continue
             try:
@@ -385,7 +385,7 @@ class NetAppBackend(StorageBackend):
                 raise ReplicationError(f"{new_src}: tmr/{c} is not promoted with a volume handle: {src_c}")
             t = kd.get("tmr", ns, c)
             if t is None:
-                raise ReplicationError(f"{new_dst}: tmr/{c} missing (was this VM protected by Harvey?)")
+                raise ReplicationError(f"{new_dst}: tmr/{c} not found. Was this VM protected by Harvey?")
             dst_c = tmr_condition(t)
             if dst_c.get("state") in ("established", "reestablished") and \
                     dst_c.get("remoteVolumeHandle") == src_c["localVolumeHandle"]:

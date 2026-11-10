@@ -301,8 +301,8 @@ protects, fails over, reprotects and fails back the group as one unit:
 ```bash
 harvey group add wsfc -n production node1 node2 --pvc archive   # two VMs + a standalone PVC
 harvey group show wsfc -n production                              # what the group replicates
-harvey protect -n production --group wsfc                         # or: harvey protect node1 -n production
-harvey failover group wsfc -n production                          # or name any member: failover vm node1
+harvey protect -n production --group wsfc                         # a group is always named explicitly
+harvey failover group wsfc -n production                          # also: reprotect/failback/unprotect --group wsfc
 ```
 
 - **VMs that share a disk must be in one recovery group.** Harvey checks this for every operation and refuses,
@@ -311,8 +311,10 @@ harvey failover group wsfc -n production                          # or name any 
   other VM's protection.
 - **One unit, once.** A shared disk is replicated once, and synced and promoted once, after **every** VM of the
   group has stopped. With Portworx the whole group is one migration, so every disk shares one recovery point.
-- **Naming one member means the whole group.** `harvey failover vm node1` adds node2 and says so. Inside the
-  group, VMs still stop and start in `failover-priority` order.
+- **Name the group, not a member.** A command that names one VM of a recovery group (`harvey failover vm node1`,
+  `protect`, `reprotect`, `unprotect`, `failback`) refuses, even with `--yes`, and prints the group's members and
+  the exact `--group` (or `failover group`) command to run. Harvey never moves a whole group because one VM was
+  named. Inside the group, VMs still stop and start in `failover-priority` order.
 - **Standalone PVCs** (`--pvc`) are replicated and promoted with the group. At the DR site they're ready for
   whatever attaches them.
 - Harvester itself only lets two VMs use one PVC when the volume is a **shareable RWX** volume, so a shared
@@ -374,6 +376,15 @@ Upgrade with `uv tool upgrade harvey`. Prefer pipx? Use
 `pipx install git+https://github.com/abonillabeeche/harvey.git`. Wheels for each release are on the
 [Releases page](https://github.com/abonillabeeche/harvey/releases) (`uv tool install harvey-X.Y.Z-py3-none-any.whl`).
 From source: `git clone … && cd harvey && pip install .`
+
+A git install is pinned to the commit it was installed from and isn't updated by itself: run
+`uv tool upgrade harvey` to pick up new commits. For development, install the checkout as an editable tool so
+the `harvey` on your PATH always runs your working tree, from any directory:
+
+```bash
+uv tool install --force --editable .        # from the root of the checkout
+uv run --with pytest pytest -q tests         # run the test suite
+```
 
 ### Requirements
 

@@ -127,3 +127,58 @@ def test_expand_plan_keeps_member_priorities():
     k.objs[("vm", "prod", "db")]["metadata"]["labels"]["failover-priority"] = "100"
     plan, notes = Replicator({"b": k}, {}, log=print).expand_plan([("prod", "web", 10, 0)], "b")
     assert ("prod", "db", 100, 0) in plan and len(plan) == 2 and "recovery group app" in notes[0]
+
+
+def test_reprotect_resumes_when_the_old_primary_vm_object_is_gone():
+    """An interrupted reprotect deletes the old primary's VM before replacing its disks. A rerun must not stop on
+    the missing VM: the backend reprotects the disks and the metadata sync recreates the replica VM."""
+    class _ReprotectRecorder(_Recorder):
+        def reprotect(self, new_src, new_dst, ns, vm, claims, wait_init):
+            self.calls.append(("reprotect", vm, tuple(claims)))
+            return []
+    REGISTRY["recorder"] = _ReprotectRecorder
+    _Recorder.calls = []
+    new_src = _ClusterKube("b", [_vm("app", ["app-root"], role="primary")])
+    old_primary = _ClusterKube("a")                              # its VM object was already removed
+    rep = Replicator({"a": old_primary, "b": new_src}, {"backend": "recorder"}, log=lambda *_: None)
+    synced = []
+    def fake_sync(ns, m, s, d, **k):                             # the real sync applies the replica VM
+        synced.append((m, s, d))
+        old_primary.create("vm", ns, {"metadata": {"name": m, "namespace": ns, "annotations": {}}})
+        return [f"vm/{m} created (Halted)"]
+    rep.sync_metadata = fake_sync
+    out = rep.reprotect("prod", "app", "b", "a")
+    assert _Recorder.calls == [("reprotect", "app", ("app-root",))]
+    assert synced == [("app", "b", "a")]
+    assert any("no VM object" in line for line in out)
+    del REGISTRY["recorder"]
+
+
+# ── a named VM never expands to its whole recovery group ─────────────────────
+import typer as _typer
+
+from harvey import cli as _cli
+
+
+def _rep_with_group():
+    k = _ClusterKube("a", [_vm("db", ["db-root"], "stack"), _vm("web", ["web-root"], "stack"), _vm("solo", ["s-root"])])
+    return Replicator({"a": k}, {}, log=lambda *_: None)
+
+
+def test_naming_a_group_member_is_refused_with_the_explicit_group_hint(capsys):
+    with pytest.raises(_typer.Exit):
+        _cli._units_to_run(_rep_with_group(), ["a"], "prod", ["db"], None, "reprotect")
+    out = capsys.readouterr().out
+    assert "db is in recovery group prod/stack" in out and "harvey reprotect -n prod --group stack" in out
+
+
+def test_failover_vm_hint_names_the_group_command(capsys):
+    with pytest.raises(_typer.Exit):
+        _cli._refuse_implicit_groups(_rep_with_group(), ["a"], "prod", ["web"], "harvey failover group {group} -n {ns}")
+    assert "harvey failover group stack -n prod" in capsys.readouterr().out
+
+
+def test_ungrouped_vms_and_explicit_groups_still_run():
+    rep = _rep_with_group()
+    assert _cli._units_to_run(rep, ["a"], "prod", ["solo"], None, "protect") == [("prod/solo", "solo", None)]
+    assert _cli._units_to_run(rep, ["a"], "prod", None, "stack", "protect") == [("prod/stack (recovery group)", None, "stack")]

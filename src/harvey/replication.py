@@ -180,15 +180,16 @@ class Replicator:
             drv = ((pv or {}).get("spec", {}).get("csi") or {}).get("driver")
             name = backend_for_driver(drv)
             if not name:
-                raise ReplicationError(f"{cluster}: PVC {ns}/{c} uses '{drv}' — no Harvey storage backend replicates "
-                                       f"it (supported: " + ", ".join(
-                                           f"{n} ({'/'.join(b.drivers)})" for n, b in sorted(REGISTRY.items())) + ")")
+                raise ReplicationError(f"{cluster}: PVC {ns}/{c} uses the '{drv}' CSI driver, which no Harvey storage "
+                                       f"backend replicates (supported: " + ", ".join(
+                                           f"{n} ({'/'.join(b.drivers)})" for n, b in sorted(REGISTRY.items())) + ").")
             found.add(name)
         if not found:
-            raise ReplicationError(f"{ns}/{vm['metadata']['name']} has no PVC volumes")
+            raise ReplicationError(f"{ns}/{vm['metadata']['name']} has no PVC-backed disks to replicate.")
         if len(found) > 1:
-            raise ReplicationError(f"{ns}/{vm['metadata']['name']} mixes storage backends {sorted(found)}; "
-                                   f"one VM (or recovery group) must be replicated by one engine")
+            raise ReplicationError(f"{ns}/{vm['metadata']['name']} uses more than one storage backend "
+                                   f"({', '.join(sorted(found))}). Harvey replicates each VM or recovery group with "
+                                   f"one backend, so please keep its disks on one backend.")
         return self.backend(found.pop())
 
     def backend_of(self, ns: str, vm_name: str, *clusters: str) -> StorageBackend:
@@ -277,10 +278,11 @@ class Replicator:
 
         cur = kd.get("vm", ns, vm_name)
         if cur is not None and (cur["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
-            raise ReplicationError(f"{dst} holds the PRIMARY copy of {ns}/{vm_name}; refusing to overwrite it "
-                                   f"(sync runs from the primary to the replica)")
+            raise ReplicationError(f"{dst} holds the primary copy of {ns}/{vm_name}, so Harvey won't overwrite it "
+                                   f"(sync copies from the primary to the replica).")
         if cur is not None and vm_status(cur) not in ("Stopped", "Halted", "Unknown"):
-            raise ReplicationError(f"replica {ns}/{vm_name} on {dst} is {vm_status(cur)}; it must be stopped")
+            raise ReplicationError(f"The replica of {ns}/{vm_name} on {dst} is {vm_status(cur)}. Please stop it; "
+                                   f"replicas stay stopped until a failover.")
         body = build_replica_vm(vm, src, src, backend=backend.name, extra_drop=drop)
         body["metadata"]["annotations"].update(self._unit_ann(unit))
         actions.append(f"vm/{vm_name} {kd.apply('vm', ns, body)} (Halted)")
@@ -305,9 +307,9 @@ class Replicator:
         for m in unit.vms:
             cur_dst = kd.get("vm", ns, m)
             if cur_dst is not None and (cur_dst["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
-                raise ReplicationError(f"{ns}/{m} is primary on {dst}; protect from {dst} instead")
+                raise ReplicationError(f"{ns}/{m} is primary on {dst}. Please run protect from {dst} instead.")
         if not unit.claims:
-            raise ReplicationError(f"{unit.describe()} has no PVC volumes")
+            raise ReplicationError(f"{unit.describe()} has no PVC-backed disks to replicate.")
         be = self.unit_backend(src, unit)
         out = [f"storage backend: {be.name} ({be.engine})"]
         if unit.group:
@@ -462,13 +464,13 @@ class Replicator:
             if src_up:
                 s = vm_status(ks.get("vm", ns, vm))
                 if unplanned and s == "Running" and not force:
-                    raise ReplicationError(f"{ns}/{vm} is still Running on {src}; an unplanned failover would "
-                                           f"split-brain. Stop it, use a planned failover, or --force.")
+                    raise ReplicationError(f"{ns}/{vm} is still running on {src}, so an unplanned failover would cause a "
+                                           f"split brain. Please stop it, use a planned failover, or add --force.")
             elif not unplanned:
-                raise ReplicationError(f"{src} is unreachable: use --unplanned (accepts data loss up to the "
-                                       f"replication lag)")
+                raise ReplicationError(f"{src} isn't reachable. To fail over anyway, please use --unplanned (this "
+                                       f"accepts data loss up to the replication lag).")
         if not hooks_cb("pre_failover"):
-            raise ReplicationError("pre_failover hook aborted")
+            raise ReplicationError("The pre_failover hook stopped the failover.")
 
         ok_units = set()
         if not unplanned:
@@ -503,7 +505,7 @@ class Replicator:
                 members = [(unit.ns, m) for m in unit.vms]
                 if not all(m in stop_times for m in members):
                     res.failed.append((unit.describe(), "final-sync", "not every VM of the unit stopped"))
-                    self.log(f"  [red]✗ {unit.describe()}: not every VM stopped — NOT promoting it[/red]")
+                    self.log(f"  [red]✗ {unit.describe()}: not every VM stopped, so Harvey didn't promote it.[/red]")
                     continue
                 last_stop = max([stop_times[m] for m in members] or [now_utc()])
                 try:
@@ -516,7 +518,7 @@ class Replicator:
                         res.rpo[f"{unit.ns}/{m}"] = 0
                 except Exception as e:   # backend-specific errors (ONTAP, Stork, ...) must not abort the others
                     res.failed.append((unit.describe(), "final-sync", str(e)))
-                    self.log(f"  [red]✗ {unit.describe()}: {e} — NOT promoting it[/red]")
+                    self.log(f"  [red]✗ {unit.describe()}: {e}; Harvey didn't promote it.[/red]")
             res.phases["final_sync"] = int(time.time() - t)
         else:
             # data loss window = age of the newest replicated recovery point, per unit (worst volume)
@@ -545,7 +547,7 @@ class Replicator:
                 self.log(f"  [red]✗ {unit.describe()}: {e}[/red]")
         res.phases["promote"] = int(time.time() - t)
         if not hooks_cb("pre_start"):
-            raise ReplicationError("pre_start hook aborted (volumes are already promoted)")
+            raise ReplicationError("The pre_start hook stopped the failover (the volumes are already promoted).")
 
         # ── start ──
         t = time.time()
@@ -590,18 +592,23 @@ class Replicator:
         for m in unit.vms:
             vm = self._get_vm(new_src, ns, m)
             if (vm["metadata"].get("labels") or {}).get(L_ROLE) != "primary":
-                raise ReplicationError(f"{ns}/{m} is not primary on {new_src}")
-            dvm = self._get_vm(new_dst, ns, m)
+                raise ReplicationError(f"{ns}/{m} isn't primary on {new_src}; reprotect runs from the current primary.")
+            dvm = self._get_vm(new_dst, ns, m, required=False)
+            if dvm is None:
+                # an earlier reprotect removed it before replacing the disks; the metadata sync below recreates it
+                out.append(f"{new_dst}: {m}: no VM object (an interrupted reprotect removed it); recreating it")
+                continue
             if vm_status(dvm) not in ("Stopped", "Halted"):
-                raise ReplicationError(f"{ns}/{m} is {vm_status(dvm)} on {new_dst}; it must be stopped "
-                                       f"(its disks will be overwritten)")
+                raise ReplicationError(f"{ns}/{m} is {vm_status(dvm)} on {new_dst}. Please stop it first, because "
+                                       f"reprotect overwrites its disks.")
             dmd = dvm["metadata"]
             if (dmd.get("labels") or {}).get(L_ROLE) == "primary":
                 mine = (vm["metadata"].get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
                 theirs = (dmd.get("annotations") or {}).get(A_PRIMARY_SINCE) or ""
                 if not mine or mine <= theirs:
-                    raise ReplicationError(f"both sites claim primary for {ns}/{m} and {new_src} is not the "
-                                           f"newer one ({mine or '?'} vs {theirs or '?'}); resolve by hand")
+                    raise ReplicationError(f"Both sites claim to be primary for {ns}/{m}, and {new_src} isn't the newer "
+                                           f"one ({mine or '?'} vs {theirs or '?'}). Please resolve this manually "
+                                           f"before you reprotect.")
                 # stale primary left behind by an unplanned failover: demote it before overwriting its disks
                 self._set_role(new_dst, ns, m, "replica", new_src, {A_REPROTECT: "true"})
                 out.append(f"{new_dst}: {m}: stale primary copy (unplanned failover) demoted to replica")
@@ -627,7 +634,8 @@ class Replicator:
                 rvm = kr.get("vm", ns, m)
                 if rvm is not None:
                     if vm_status(rvm) not in ("Stopped", "Halted"):
-                        raise ReplicationError(f"replica {ns}/{m} on {replica} is {vm_status(rvm)}; not deleting")
+                        raise ReplicationError(f"The replica of {ns}/{m} on {replica} is {vm_status(rvm)}, so Harvey didn't "
+                                       f"delete it.")
                     kr.delete("vm", ns, m)
                     out.append(f"{replica}: vm/{m} deleted")
             deleter = getattr(be, "delete_replica_volumes", None)

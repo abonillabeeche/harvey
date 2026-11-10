@@ -256,7 +256,7 @@ class HarvesterClient(KubeClient):
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
         console.print("[bold yellow]Configuration file not found.[/bold yellow]")
-        console.print(f"Run [bold cyan]harvey config init[/bold cyan] to create one at {CONFIG_FILE}")
+        console.print(f"Please run [bold cyan]harvey config init[/bold cyan] to create one at {CONFIG_FILE}.")
         sys.exit(1)
     with open(CONFIG_FILE) as fh:
         return yaml.safe_load(fh)
@@ -265,7 +265,8 @@ def load_config() -> dict:
 def make_client(config: dict, name: str) -> HarvesterClient:
     clusters = config.get("clusters", {})
     if name not in clusters:
-        console.print(f"[bold red]Cluster '{name}' not found in config.[/bold red] Available: {list(clusters)}")
+        console.print(f"[bold red]Cluster '{name}' isn't defined in the configuration.[/bold red] "
+                      f"Available clusters: {', '.join(clusters) or 'none'}.")
         sys.exit(1)
     c = clusters[name]
     if isinstance(c, str):  # legacy: bare Rancher cluster ID
@@ -275,7 +276,7 @@ def make_client(config: dict, name: str) -> HarvesterClient:
     if c.get("rancher_cluster_id"):
         return HarvesterClient.from_rancher(name, config["rancher_url"], config["api_token"],
                                             c["rancher_cluster_id"], debug=state["debug"])
-    console.print(f"[bold red]Cluster '{name}': set 'kubeconfig' or 'rancher_cluster_id'.[/bold red]")
+    console.print(f"[bold red]Cluster '{name}' needs a 'kubeconfig' or 'rancher_cluster_id' setting.[/bold red]")
     sys.exit(1)
 
 
@@ -287,8 +288,8 @@ def resolve_pair(config: dict, source: Optional[str], destination: Optional[str]
     d = config.get("defaults") or {}
     s, t = source or d.get("source"), destination or d.get("destination")
     if not s or not t:
-        console.print("[bold red]Give --source/--destination or set defaults.source/destination in the config."
-                      "[/bold red]")
+        console.print("[bold red]Please specify --source and --destination, or set defaults.source and "
+                      "defaults.destination in the configuration.[/bold red]")
         sys.exit(1)
     return s, t
 
@@ -370,7 +371,7 @@ def _run_hook(hook: dict, context: dict) -> bool:
             return True
         msg = f"Hook '{name}' exited {r.returncode}" + (f": {r.stderr.strip()}" if r.stderr.strip() else "")
         if on_failure == "abort":
-            console.print(f"  [bold red]✗ {msg} — aborting.[/bold red]")
+            console.print(f"  [bold red]✗ {msg}. Stopping (on_failure=abort).[/bold red]")
             return False
         console.print(f"  [yellow]⚠ {msg} — continuing (on_failure=warn).[/yellow]")
         return True
@@ -429,7 +430,8 @@ def _fetch_vm_maps(client_source: HarvesterClient, client_dest: HarvesterClient)
         src_data = client_source.get_vms()
         dst_data = client_dest.get_vms()
     if not src_data or not dst_data:
-        console.print("[red]Failed to retrieve VM data from one or both clusters.[/red]")
+        console.print("[red]Couldn't read VM data from one or both clusters. Please check that both are "
+                      "reachable.[/red]")
         return None, None
     vms_src = {(v["metadata"]["namespace"], v["metadata"]["name"]): v for v in src_data.get("items", [])}
     vms_dst = {(v["metadata"]["namespace"], v["metadata"]["name"]): v for v in dst_data.get("items", [])}
@@ -454,9 +456,9 @@ def _build_plan_from_inventory(
         role_dst = ((dvm or {}).get("metadata", {}).get("labels") or {}).get(L_ROLE)
         if role_src != "primary" or role_dst != "replica":
             if vm_names_filter:
-                console.print(f"[yellow]Skipping {key[0]}/{key[1]}: not protected in this direction "
+                console.print(f"[yellow]Skipping {key[0]}/{key[1]}: it isn't protected in this direction "
                               f"(source role={role_src}, destination role={role_dst}). "
-                              f"Run 'harvey protect' first.[/yellow]")
+                              f"Please run 'harvey protect' first.[/yellow]")
             continue
         if _vm_printable(vm) != "Running" and not vm_names_filter:
             continue  # namespace/all failovers move running workloads only
@@ -542,7 +544,7 @@ def _save_plan_from_dry_run(plan: list, source: str, destination: str):
 
     name = Prompt.ask("Plan name").strip()
     if not name:
-        console.print("[yellow]No name given — skipping save.[/yellow]")
+        console.print("[yellow]No name given, so the plan wasn't saved.[/yellow]")
         return
 
     plan_file = PLANS_DIR / f"{name}.yaml"
@@ -787,7 +789,7 @@ def _run_plan_test(
                 if not created or created.get("http_status") == 409:
                     # 409 = already exists from a previous interrupted test; treat as ok
                     if created and created.get("http_status") == 409:
-                        console.print(f"  [yellow]⚠ Shadow VM already exists (leftover?). Reusing.[/yellow]")
+                        console.print(f"  [yellow]⚠ A shadow VM already exists (probably from an earlier test); reusing it.[/yellow]")
                     else:
                         console.print(f"  [red]✗ Failed to create shadow VM.[/red]")
                         results.append((pg_name, orig_ns, vm_name, shadow_ns, "clone_failed"))
@@ -910,7 +912,8 @@ def vm_status(
     """Compares VM status across two clusters and shows DR readiness."""
     config = load_config()
     if config.get("rancher_url") == CONFIG_TEMPLATE["rancher_url"]:
-        console.print("[bold red]Default config detected — edit ~/.config/harvey/config.yaml first.[/bold red]")
+        console.print("[bold red]Harvey is still using the default configuration. Please edit "
+                      "~/.config/harvey/config.yaml first.[/bold red]")
         sys.exit(1)
 
     client1, client2 = get_clients(config, cluster1, cluster2)
@@ -920,7 +923,8 @@ def vm_status(
         d2 = client2.get_vms()
 
     if not d1 or not d2:
-        console.print("[red]Could not retrieve VM data from one or both clusters.[/red]")
+        console.print("[red]Couldn't read VM data from one or both clusters. Please check that both are "
+                      "reachable.[/red]")
         return
 
     vms1 = {(v["metadata"]["namespace"], v["metadata"]["name"]): v for v in d1.get("items", [])}
@@ -974,7 +978,8 @@ def vm_status(
     console.print(t)
 
     if split_brain_count:
-        console.print(f"\n[bold red]⚠  {split_brain_count} split-brain condition(s) — immediate manual intervention required.[/bold red]")
+        console.print(f"\n[bold red]⚠  {split_brain_count} split-brain condition(s) found. Please resolve them "
+                      f"manually before any other operation.[/bold red]")
     if ready_count:
         console.print(f"[green]{ready_count} VM(s) ready for failover.[/green]")
 
@@ -1003,11 +1008,12 @@ def health_check(
             count = len(data.get("items", []))
             console.print(f"  [green]✓[/green] '{client.cluster_name}' reachable — {count} VMs found.")
         else:
-            console.print(f"  [red]✗[/red] '{client.cluster_name}' unreachable.")
+            console.print(f"  [red]✗[/red] '{client.cluster_name}' isn't reachable.")
             all_ok = False
 
     if not all_ok:
-        console.print(Panel("[bold red]✗ Health check FAILED — connectivity issues.[/bold red]", border_style="red"))
+        console.print(Panel("[bold red]✗ Health check failed: Harvey can't reach every cluster.[/bold red]",
+                            border_style="red"))
         return
 
     # 2. VM coverage
@@ -1030,7 +1036,7 @@ def health_check(
     console.print(f"  Only on {cluster2}: [dim]{len(only_in_2)}[/dim]")
 
     if split_brain:
-        console.print(f"\n  [bold red]✗ SPLIT BRAIN — {len(split_brain)} VM(s) running on both clusters:[/bold red]")
+        console.print(f"\n  [bold red]✗ Split brain: {len(split_brain)} VM(s) are running on both clusters:[/bold red]")
         for ns, name in split_brain:
             console.print(f"    [red]{ns}/{name}[/red]")
         all_ok = False
@@ -1045,7 +1051,7 @@ def health_check(
     for ns, name in protected:
         p, r = rep.direction(ns, name, cluster1, cluster2)
         if not p:
-            console.print(f"    [red]✗ {ns}/{name}: no single primary[/red]")
+            console.print(f"    [red]✗ {ns}/{name}: no single primary (not protected, or both sites claim primary)[/red]")
             all_ok = False
             continue
         try:
@@ -1058,10 +1064,11 @@ def health_check(
         rv = rep.k[r].get("vm", ns, name)
         if rep.stale_primary.get((ns, name)):
             console.print(f"    [yellow]⚠ {ns}/{name}: primary on {p} since an unplanned failover; {r} still holds "
-                          f"a stale primary copy — keep it stopped and run harvey reprotect[/yellow]")
+                          f"a stale primary copy. Please keep it stopped and run harvey reprotect.[/yellow]")
             all_ok = False
         elif ((rv or {}).get("metadata", {}).get("annotations") or {}).get(A_REPROTECT):
-            console.print(f"    [yellow]⚠ {ns}/{name}: running on {p} without protection — run harvey reprotect[/yellow]")
+            console.print(f"    [yellow]⚠ {ns}/{name}: running on {p} without protection. Please run harvey "
+                          f"reprotect.[/yellow]")
             all_ok = False
         elif bad:
             for v in bad:
@@ -1079,14 +1086,16 @@ def health_check(
         for p in plans:
             console.print(f"    [dim]• {p.stem}[/dim]")
     else:
-        console.print(f"\n  [yellow]⚠  No recovery plans found. Run 'harvey plan new <name>' to create one.[/yellow]")
+        console.print(f"\n  [yellow]⚠  No recovery plans found. You can create one with 'harvey plan new <name>'."
+                      f"[/yellow]")
 
     console.print()
     if all_ok:
         console.print(Panel("[bold green]✓ DR health check PASSED — environment ready for failover.[/bold green]",
                             border_style="green"))
     else:
-        console.print(Panel("[bold red]✗ DR health check FAILED — resolve issues before failover.[/bold red]",
+        console.print(Panel("[bold red]✗ DR health check failed. Please resolve the issues above before a "
+                            "failover.[/bold red]",
                             border_style="red"))
 
     _audit("health_check", {"cluster1": cluster1, "cluster2": cluster2,
@@ -1132,8 +1141,8 @@ NsOpt = Annotated[str, typer.Option("--namespace", "-n", help="Namespace of the 
 def _pair_for_vm(rep: Replicator, ns: str, vm: str, a: str, b: str) -> Tuple[str, str]:
     p, r = rep.direction(ns, vm, a, b)
     if not p:
-        console.print(f"[bold red]{ns}/{vm}: no single primary found between {a} and {b} "
-                      f"(not protected, or both claim primary).[/bold red]")
+        console.print(f"[bold red]{ns}/{vm}: Harvey found no single primary between {a} and {b}. The VM may "
+                      f"not be protected, or both sites claim to be primary.[/bold red]")
         raise typer.Exit(1)
     return p, r
 
@@ -1141,37 +1150,48 @@ def _pair_for_vm(rep: Replicator, ns: str, vm: str, a: str, b: str) -> Tuple[str
 GroupOpt = Annotated[Optional[str], typer.Option("--group", "-g", help="Recovery group instead of VM names.")]
 
 
-def _units_to_run(rep: Replicator, cluster_candidates: List[str], ns: str, vm_names: Optional[List[str]],
-                  group: Optional[str]) -> List[Tuple[str, Optional[str], Optional[str]]]:
-    """[(label, vm, group)] with one entry per protection unit: a named group, or each VM (a VM in a recovery
-    group stands for its whole group, listed once)."""
-    if not vm_names and not group:
-        console.print("[bold red]Give VM name(s) or --group.[/bold red]")
-        raise typer.Exit(1)
-    if group:
-        return [(f"{ns}/{group} (recovery group)", None, group)]
-    out, seen = [], set()
-    for vm in vm_names:
-        unit = None
+def _refuse_implicit_groups(rep: Replicator, cluster_candidates: List[str], ns: str, vm_names: Optional[List[str]],
+                            hint: str):
+    """Never act on a whole recovery group because one of its VMs was named: with --yes that could silently stop
+    and move dozens of VMs. If a named VM is in a group, stop and tell the operator to name the group.
+    `hint` is the command to suggest, with {group} and {ns} placeholders."""
+    found: dict = {}
+    for vm in vm_names or []:
         for c in cluster_candidates:
             try:
                 unit = rep.unit(c, ns, vm)
-                break
             except ReplicationError as e:
                 if "shares disks" in str(e):
                     console.print(f"[bold red]✗ {e}[/bold red]")
                     raise typer.Exit(1)
+                continue
             except KubeError:
                 continue
-        key = unit.key if unit else (ns, vm)
-        if key in seen:
-            continue
-        seen.add(key)
-        if unit and unit.group:
-            out.append((f"{ns}/{unit.group} (recovery group: {', '.join(unit.vms)})", None, unit.group))
-        else:
-            out.append((f"{ns}/{vm}", vm, None))
-    return out
+            if unit.group:
+                found.setdefault(unit.group, (unit, []))[1].append(vm)
+            break
+    if not found:
+        return
+    for g, (unit, named) in found.items():
+        extra = f"; standalone PVCs: {', '.join(unit.standalone)}" if unit.standalone else ""
+        console.print(f"[bold red]✗ {', '.join(named)} {'is' if len(named) == 1 else 'are'} in recovery group "
+                      f"{ns}/{g} (VMs: {', '.join(unit.vms)}{extra}).[/bold red]", soft_wrap=True)
+        console.print("  Harvey handles a recovery group as a whole. Please name the group explicitly:")
+        console.print(f"    [bold]{hint.format(group=g, ns=ns)}[/bold]", soft_wrap=True)
+    raise typer.Exit(1)
+
+
+def _units_to_run(rep: Replicator, cluster_candidates: List[str], ns: str, vm_names: Optional[List[str]],
+                  group: Optional[str], cmd: str) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    """[(label, vm, group)] with one entry per protection unit: the named group, or each named VM. A named VM
+    that belongs to a recovery group is refused (the group must be named with --group)."""
+    if not vm_names and not group:
+        console.print("[bold red]Please specify one or more VM names, or --group.[/bold red]")
+        raise typer.Exit(1)
+    if group:
+        return [(f"{ns}/{group} (recovery group)", None, group)]
+    _refuse_implicit_groups(rep, cluster_candidates, ns, vm_names, f"harvey {cmd} -n {{ns}} --group {{group}}")
+    return [(f"{ns}/{vm}", vm, None) for vm in dict.fromkeys(vm_names)]
 
 
 def _pair_for_unit(rep: Replicator, ns: str, vm: Optional[str], group: Optional[str], a: str, b: str):
@@ -1184,7 +1204,7 @@ def _pair_for_unit(rep: Replicator, ns: str, vm: Optional[str], group: Optional[
                 continue
             if members:
                 return _pair_for_vm(rep, ns, members[0], a, b)
-        console.print(f"[bold red]recovery group {ns}/{group}: no member VMs found[/bold red]")
+        console.print(f"[bold red]Recovery group {ns}/{group} has no member VMs.[/bold red]")
         raise typer.Exit(1)
     return _pair_for_vm(rep, ns, vm, a, b)
 
@@ -1207,7 +1227,7 @@ def protect(
     source, destination = resolve_pair(config, source, destination)
     rep = make_replicator(config, [source, destination])
     rc = 0
-    for label, vm, grp in _units_to_run(rep, [source], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [source], namespace, vm_names, group, "protect"):
         console.rule(f"[bold]protect {label}: {source} → {destination}[/bold]")
         try:
             for line in rep.protect(namespace, vm, source, destination, wait_init=wait, group=grp):
@@ -1237,7 +1257,7 @@ def unprotect(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
-    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group, "unprotect"):
         p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
         what = "and DELETE the replica VM(s) + volumes " if delete_replica else ""
         if not yes and not Confirm.ask(f"Stop replicating {label} ({p} → {r}) {what}?"):
@@ -1272,7 +1292,7 @@ def sync(
         for ns, vm in targets:
             p, r = rep.direction(ns, vm, a, b)
             if not p:
-                console.print(f"[yellow]{ns}/{vm}: direction unclear, skipped[/yellow]")
+                console.print(f"[yellow]{ns}/{vm}: skipped, because Harvey couldn't tell which site is primary.[/yellow]")
                 continue
             try:
                 acts = rep.sync_metadata(ns, vm, p, r)
@@ -1320,7 +1340,7 @@ def replication_status(
     for ns, vm in vms:
         p, r = rep.direction(ns, vm, a, b)
         if not p:
-            t.add_row(f"{ns}/{vm}\n[red]direction unclear[/red]", "", "", "", "", "", "", "", "")
+            t.add_row(f"{ns}/{vm}\n[red]primary site unclear[/red]", "", "", "", "", "", "", "", "")
             continue
         try:
             unit = rep.unit(p, ns, vm)
@@ -1378,7 +1398,7 @@ def reprotect(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
-    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group):
+    for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group, "reprotect"):
         p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
         if not yes and not Confirm.ask(f"Reverse-resync {label}: {p} → {r} (overwrites {r}'s disks)?"):
             continue
@@ -1395,8 +1415,9 @@ def reprotect(
 # ── failback ──────────────────────────────────────────────────────────────────
 @app.command("failback")
 def failback(
-    vm_names: Annotated[List[str], typer.Argument(help="VM name(s) to return to their original site.")],
-    namespace: NsOpt,
+    vm_names: Annotated[Optional[List[str]], typer.Argument(help="VM name(s) to return to their original site.")] = None,
+    namespace: NsOpt = ...,
+    group: GroupOpt = None,
     source: SourceOpt = None,
     destination: DestOpt = None,
     no_reprotect: Annotated[bool, typer.Option("--no-reprotect", help="Do not re-establish replication "
@@ -1411,12 +1432,19 @@ def failback(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
+    if not vm_names and not group:
+        console.print("[bold red]Please specify one or more VM names, or --group.[/bold red]")
+        raise typer.Exit(1)
     groups: dict = {}
-    for vm in vm_names:
-        p, r = _pair_for_vm(rep, namespace, vm, a, b)
-        for m in rep.unit(p, namespace, vm).vms:      # a recovery group goes back as a whole
-            if m not in groups.setdefault((p, r), []):
-                groups[(p, r)].append(m)
+    if group:
+        p, r = _pair_for_unit(rep, namespace, None, group, a, b)
+        groups[(p, r)] = list(rep.unit(p, namespace, group=group).vms)
+    else:
+        _refuse_implicit_groups(rep, [a, b], namespace, vm_names, "harvey failback -n {ns} --group {group}")
+        for vm in vm_names:
+            p, r = _pair_for_vm(rep, namespace, vm, a, b)
+            if vm not in groups.setdefault((p, r), []):
+                groups[(p, r)].append(vm)
     for (p, r), vms in groups.items():
         cs, cd = make_client(config, p), make_client(config, r)
         vms_src, vms_dst = _fetch_vm_maps(cs, cd)
@@ -1463,6 +1491,9 @@ def failover_vms(
     """Fails over specific protected VMs (stop → final sync → promote → start)."""
     config = load_config()
     source, destination = resolve_pair(config, source, destination)
+    rep = make_replicator(config, [destination] if unplanned else [source, destination])
+    _refuse_implicit_groups(rep, [destination] if unplanned else [source, destination], namespace, vm_names,
+                            "harvey failover group {group} -n {ns}")
     if unplanned:
         plan = [(namespace, v, 0, 0) for v in vm_names]  # source may be unreachable: trust the replica side
         cd = make_client(config, destination)
@@ -1836,7 +1867,7 @@ def failover_group(
     cd = make_client(config, destination)
     members = [v for v in cd.list("vm", namespace, label_selector=f"{L_GROUP}={name}")]
     if not members:
-        console.print(f"[bold red]recovery group {namespace}/{name}: no members on {destination}[/bold red]")
+        console.print(f"[bold red]Recovery group {namespace}/{name} has no members on {destination}.[/bold red]")
         raise typer.Exit(1)
     plan = [(namespace, v["metadata"]["name"], *_extract_labels(v)) for v in members]
     _ad_hoc_failover(config, plan, source, destination, yes, dry_run, unplanned, force)
