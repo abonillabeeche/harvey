@@ -190,3 +190,21 @@ def test_reprotect_gives_up_after_the_automatic_retry_with_a_hint():
     dst.merge_patch = merge_patch
     with pytest.raises(ReplicationError, match=r"tmr/vm1-root failed: Could not reestablish mirror.*trident-controller.*run harvey reprotect again"):
         be.reprotect("b", "a", "demo", "vm1", ["vm1-root"], wait_init=False)
+
+
+def test_promote_requests_every_volume_before_waiting():
+    # a recovery group's disks are promoted together: all patches first, then one shared wait (one LIST per poll)
+    events = []
+
+    class K(_TridentKube):
+        def merge_patch(self, kind, ns, name, patch):
+            events.append(("patch", name))
+            return super().merge_patch(kind, ns, name, patch)
+
+        def list(self, kind, ns=None, label_selector=None):
+            events.append(("list", kind))
+            return super().list(kind, ns, label_selector)
+    dst = K("b", [("tmr", "demo", _tmr(f"d{i}", "established", None)) for i in range(3)])
+    be = NetAppBackend({"b": dst}, {}, TIMEOUTS, log=print)
+    be.promote("a", "b", "demo", "vm1", ["d0", "d1", "d2"], src_up=True, unplanned=False)
+    assert events == [("patch", "d0"), ("patch", "d1"), ("patch", "d2"), ("list", "tmr")]

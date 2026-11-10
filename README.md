@@ -64,6 +64,7 @@ Inside the guest, the only gap in a timestamp written every 5 seconds was the ou
 - [The DR lifecycle, in commands](#the-dr-lifecycle-in-commands)
 - [Priorities: who comes back first](#priorities-who-comes-back-first)
 - [Recovery groups and shared disks](#recovery-groups-and-shared-disks)
+  - [Design for scale: reprotect is heavy, so group by application](#design-for-scale-reprotect-is-heavy-so-group-by-application)
 - [Measured in the lab](#measured-in-the-lab)
 - [Safety rails](#safety-rails)
 - [Installation](#installation) · [Configuration](#configuration) ([full reference](docs/configuration.md)) · [Command reference](#command-reference)
@@ -321,6 +322,40 @@ harvey failover group wsfc -n production                          # also: reprot
   disk is always deliberate. The group rule makes sure those VMs also move together.
 - A group lives in one namespace, and its VMs and PVCs must all be on one storage backend. Membership is the
   label `harvey.io/recovery-group=<name>`, so you can set it with `kubectl`, GitOps or the Harvester UI too.
+
+### Design for scale: reprotect is heavy, so group by application
+
+Reprotect is the heaviest routine operation in Harvey. For every disk it asks the storage to reverse the
+replication (a SnapMirror resync, a new Longhorn DR volume, a new Portworx schedule) and then copies the VM's
+metadata back. On a namespace with hundreds of VMs that's hundreds of storage operations, all competing for the
+same arrays, links and transfer slots (ONTAP allows 100–250 concurrent transfers per system).
+
+How Harvey runs it decides how long that takes:
+
+- **Units run one after another.** A unit is a recovery group, or one VM that isn't in a group.
+  `harvey reprotect vm1 vm2 … vm300` is 300 units in a row. In the lab one small VM took 20–30 s, so 300
+  ungrouped VMs would take about two hours.
+- **Inside a unit, the disks work together.** With NetApp, Harvey requests the resync (and on failover, the
+  promote) of every disk in the group first, then waits for all of them with one API call per poll. A group
+  takes roughly as long as its slowest disk, not the sum of its disks. With Portworx a group is one migration.
+- **Failures are contained and retried.** A failed resync is retried once on the spot. If it still fails,
+  Harvey names each failed disk, carries on with the next unit, and exits 1 at the end. Running the same
+  `harvey reprotect` again retries only what failed. Reprotect is safe to repeat.
+
+That makes recovery groups the main design decision for a large site, not an afterthought:
+
+- **Consistency.** The VMs of one application stop, sync, promote and start together, so the database and the
+  app servers never come up from different moments. That's the reason to group in the first place.
+- **Scale.** 300 VMs that form 15 applications are 15 units instead of 300. Each unit's disks are handled in
+  parallel, so the whole namespace needs far fewer sequential steps.
+- **Blast radius.** A unit is all or nothing. One disk with a broken relationship holds back its own group and
+  nothing else, so keep groups to one application rather than one per namespace.
+- **Size.** Keep a group's disk count well within the array's concurrent-transfer limit, and remember that a
+  NetApp final sync during a *planned* failover still runs disk by disk inside a unit (about 15–40 s per disk
+  in the lab).
+
+These estimates come from the per-VM lab timings and from how the code runs. Harvey hasn't been measured at
+hundreds of VMs yet.
 
 ---
 

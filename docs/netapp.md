@@ -183,7 +183,10 @@ In-guest timestamps were written to all three disks every 5 seconds.
   because the VM is stopped before the final update. ONTAP consistency groups aren't available through Trident,
   and VolumeGroupSnapshots don't work with replication yet.
 - **Scale.** One relationship per disk. ONTAP allows 100 or 250 concurrent transfers per system, depending on the
-  platform.
+  platform. Harvey handles one unit (a recovery group or an ungrouped VM) at a time. Inside a unit, reprotect and
+  promote request every disk at once and wait for them together, but the final sync of a planned failover runs disk
+  by disk. Group VMs by application to keep both the number of sequential steps and the blast radius small; see
+  [Design for scale](../README.md#design-for-scale-reprotect-is-heavy-so-group-by-application).
 - **Simulators.** A 6 GB ONTAP simulator runs out of WAFL memory under replication load, and transfers stall
   silently. Give simulators 10 GB. Harvey's stall detection keeps a demo moving, but it's no substitute for memory.
 

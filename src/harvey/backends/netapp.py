@@ -372,31 +372,41 @@ class NetAppBackend(StorageBackend):
         return worst
 
     def promote(self, src: str, dst: str, ns: str, vm: str, claims: List[str], src_up: bool, unplanned: bool):
+        """All of a unit's volumes at once: abort running transfers, request every promote, one shared wait (one
+        LIST per poll), then check each volume really is read-write. A recovery group with many disks takes about
+        as long as one disk instead of one disk's time per volume."""
+        k = self.k[dst]
+        prepared = {}
         for c in claims:
-            self._promote_one(dst, ns, c)
+            prepared[c] = self._prepare_promote(dst, ns, c)
+            k.merge_patch("tmr", ns, c, {"spec": {"state": "promoted"}})
+        self._wait_tmrs(dst, ns, claims, ("promoted",), need_handle=False)
+        for c in claims:
+            self._ensure_rw(dst, ns, c, *prepared[c])
 
-    def _promote_one(self, dst: str, ns: str, claim: str):
-        """Promote the replica volume to read-write, and make sure it really is.
+    def _prepare_promote(self, dst: str, ns: str, claim: str) -> Tuple[Optional[OntapClient], Optional[str]]:
+        handle = tmr_condition(self.k[dst].get("tmr", ns, claim)).get("localVolumeHandle")
+        if not handle:
+            return None, None
+        try:
+            ontap = self.ontap_for_claim(dst, ns, claim)
+            self._abort_running(ontap, handle)
+            return ontap, handle
+        except (ReplicationError, OntapError) as e:
+            self.log(f"  [yellow]{claim}: ONTAP not reachable before promote ({e})[/yellow]")
+            return None, handle
+
+    def _ensure_rw(self, dst: str, ns: str, claim: str, ontap: Optional[OntapClient], handle: Optional[str]):
+        """Make sure a promoted volume really is read-write.
 
         Observed with Trident 26.06 + ONTAP 9.16.1: the TMR can reach status 'promoted' while the volume is still
         DP, so the VM cannot attach it ("volume is not read-write"):
           * a scheduled transfer was running -> Trident's break fails ("snapmirror transfer already in progress"),
             is requeued, and the TMR still ends up 'promoted';
           * the relationship was already quiesced (paused) -> Trident marks it promoted without breaking.
-        So: abort a running transfer, let Trident promote, verify the volume type in ONTAP, and if it is still DP
-        do quiesce + break ourselves."""
+        So: abort a running transfer (_prepare_promote), let Trident promote, verify the volume type in ONTAP, and
+        if it is still DP do quiesce + break ourselves."""
         k = self.k[dst]
-        handle = tmr_condition(k.get("tmr", ns, claim)).get("localVolumeHandle")
-        ontap = None
-        if handle:
-            try:
-                ontap = self.ontap_for_claim(dst, ns, claim)
-                self._abort_running(ontap, handle)
-            except (ReplicationError, OntapError) as e:
-                self.log(f"  [yellow]{claim}: ONTAP not reachable before promote ({e})[/yellow]")
-                ontap = None
-        k.merge_patch("tmr", ns, claim, {"spec": {"state": "promoted"}})
-        self._wait_tmr(dst, ns, claim, ("promoted",), need_handle=False)
         if not (ontap and handle) or ontap.volume_type(handle) != "dp":
             return
         rel = ontap.relationship(handle)

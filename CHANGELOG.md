@@ -30,6 +30,8 @@ Pluggable storage backends and Portworx async DR.
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
 
 ### Changed
+- **README: "Design for scale"**: reprotect is heavy, Harvey runs one unit at a time, and recovery groups are the
+  main lever for consistency, speed and blast radius at hundreds of VMs.
 - **`plan run --test` is a roadmap item.** It booted the VM spec in a shadow namespace without the replica
   volumes, so the test VMs couldn't start and the test proved little. It now explains that DR test mode isn't
   available yet and changes nothing. The shadow-VM spec builder stays for the real feature.
@@ -45,6 +47,8 @@ Pluggable storage backends and Portworx async DR.
   namespace-scoped identity got HTTP 403 from the cluster-wide list)
 
 ### Fixed
+- **NetApp: a unit's volumes are promoted together**: every promote is requested first, then one shared wait,
+  then the read-write check per volume. A recovery group's promote takes about as long as its slowest disk.
 - **NetApp: TMR waits fail fast and scale.** A TMR whose status is `failed` for the current spec ends the wait at
   once instead of after `timeouts.tmr` (a reprotect with the intercluster LIF down: 306 s → 13 s). Waits for several
   disks use one LIST of the namespace's TMRs per poll instead of one GET per TMR. Failures are reported one line per
