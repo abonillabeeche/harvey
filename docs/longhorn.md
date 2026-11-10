@@ -154,9 +154,10 @@ volumes change outside of Harvey operations.
 ### Harvey trusts the engine, not the volume, for "restored"
 
 A DR volume's `status.lastBackup` names the newest backup it should restore. Only the engine's
-`status.lastRestoredBackup` proves that the data was restored. Harvey's final sync and `replication status`
-require the engine. With the V2 engine in the lab, `lastBackup` moved on while the engine never restored
-anything (see the V2 section below), and the volume shows `restore not confirmed` instead of `up to date`.
+`status.lastRestoredBackup` proves that the data was restored. Harvey's final sync, `replication status`,
+protect's wait for the first restore and the failover preflight require the engine. With the V2 engine in
+the lab, `lastBackup` moved on while the engine never restored anything (see the V2 section below), and the
+volume shows `restore not confirmed` instead of `up to date`.
 
 When Harvey waits for a specific backup (final sync, reprotect), it accepts that backup **or a newer one** of the
 same volume, ordered by snapshot time. A DR volume always follows the newest backup on the target, so a scheduled

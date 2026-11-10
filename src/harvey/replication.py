@@ -453,6 +453,9 @@ class Replicator:
             dvm = self._get_vm(dst, ns, vm)
             if (dvm["metadata"].get("labels") or {}).get(L_ROLE) == "primary":
                 raise ReplicationError(f"{ns}/{vm} is already primary on {dst}")
+            if (dvm["metadata"].get("annotations") or {}).get(A_REPROTECT):
+                raise ReplicationError(f"{ns}/{vm} on {dst} still holds the copy from before the last failover. Please "
+                                       f"run harvey reprotect first.")
             unit = self.unit(dst, ns, vm)
             unit_of[(ns, vm)] = unit.key
             if unit.key not in units:

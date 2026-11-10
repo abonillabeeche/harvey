@@ -53,6 +53,11 @@ Pluggable storage backends and Portworx async DR.
   `runStrategy`, no `harvey.io/*` labels or `dataVolumeTemplates`); `--yes` skips the confirmation
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and
   under-reported the loss by the transfer time)
+- NetApp: a failover that stopped after promoting some volumes can be re-run (`--unplanned`); reprotect retries a
+  failed reestablish; quiesce/break wait for the ONTAP job and report its error
+- failover refuses a destination that still holds the copy from before the last failover (run reprotect first)
+- Longhorn: protect's wait for the first restore and the failover preflight require the engine's
+  `lastRestoredBackup` instead of the volume's `lastBackup`
 
 ## [0.2.0] — unreleased
 

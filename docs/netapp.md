@@ -50,6 +50,7 @@ Harvey adds nothing here:
   | `PATCH .../transfers/{uuid}` (`state: aborted`) | abort a stalled or conflicting transfer |
   | `PATCH /api/snapmirror/relationships/{uuid}` (`paused`, `broken_off`, `snapmirrored`) | quiesce + break when Trident left a volume DP, restart a stalled baseline |
   | `GET /api/storage/volumes` | check that a promoted volume really is read-write |
+  | `GET /api/cluster/jobs/{uuid}` | wait for the job of a quiesce or break and report its error |
 
   The login needs the `http` application (ONTAP REST) enabled, which Trident's REST mode already requires.
 - [ ] **Backends defined as `TridentBackendConfig` objects with a username/password Secret.** Harvey finds a PVC's

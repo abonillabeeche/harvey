@@ -103,9 +103,14 @@ class OntapClient:
         return self._req("GET", f"snapmirror/relationships/{rel_uuid}/transfers/{transfer_uuid}",
                          params={"fields": "state,bytes_transferred,end_time,error_info"})
 
-    def set_state(self, rel_uuid: str, state: str):
-        """PATCH the relationship state: 'paused' (= quiesce), 'broken_off' (= break), 'snapmirrored' (= resync)."""
-        self._req("PATCH", f"snapmirror/relationships/{rel_uuid}", json={"state": state})
+    def set_state(self, rel_uuid: str, state: str, wait: bool = True, timeout_s: int = 180):
+        """PATCH the relationship state: 'paused' (= quiesce), 'broken_off' (= break), 'snapmirrored' (= resync).
+        wait: block until ONTAP's job finishes and raise its error (a failed quiesce/break otherwise only shows up
+        as a timeout later)."""
+        d = self._req("PATCH", f"snapmirror/relationships/{rel_uuid}", params={"return_timeout": "10"},
+                      json={"state": state})
+        if wait:
+            self._wait_job(d, f"SnapMirror {state} of {rel_uuid}", timeout_s)
 
     def volume_type(self, handle: str) -> Optional[str]:
         """'svm:volume' -> 'rw' | 'dp' | 'ls' (None if not found)."""
@@ -113,6 +118,20 @@ class OntapClient:
         d = self._req("GET", "storage/volumes", params={"svm.name": svm, "name": vol, "fields": "type"})
         recs = d.get("records", [])
         return recs[0].get("type") if recs else None
+
+    def _wait_job(self, response: dict, what: str, timeout_s: int):
+        """Waits for the job an ONTAP call returned (no job = already done)."""
+        job = (response.get("job") or {}).get("uuid")
+        deadline = time.time() + timeout_s
+        while job and time.time() < deadline:
+            j = self._req("GET", f"cluster/jobs/{job}", params={"fields": "state,message"})
+            if j.get("state") == "success":
+                return
+            if j.get("state") == "failure":
+                raise OntapError(f"{what} failed: {j.get('message')}")
+            time.sleep(1)
+        if job:
+            raise OntapError(f"{what} still running after {timeout_s}s")
 
     def abort(self, rel_uuid: str, transfer_uuid: str):
         self._req("PATCH", f"snapmirror/relationships/{rel_uuid}/transfers/{transfer_uuid}", json={"state": "aborted"})

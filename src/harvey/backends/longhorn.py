@@ -399,19 +399,17 @@ class LonghornBackend(StorageBackend):
             out.append(f"{dst}: DR volume {v} created from {b['metadata']['name']} "
                        f"({(b.get('status') or {}).get('size', '?')} B)")
         for c, v in vols.items():
-            st = (kd.get("lhvolume", NS, v) or {}).get("status") or {}
-            if not st.get("lastBackup"):
+            if not self._engine_restored(dst, v):
                 self.log(f"  waiting for {v} to finish its first restore on {dst} ...")
-                kd.wait_for(lambda: ((kd.get("lhvolume", NS, v) or {}).get("status") or {}).get("lastBackup"),
-                            self.timeouts["transfer"], interval=5, what=f"first restore of {v}")
+                kd.wait_for(lambda: self._engine_restored(dst, v), self.timeouts["transfer"], interval=5,
+                            what=f"first restore of {v}")
         return out
 
     def wait_initialized(self, src: str, dst: str, ns: str, vm: str, claims: List[str]):
         for c in claims:
             v = self._volume_name(src, ns, c)
-            kd = self.k[dst]
-            kd.wait_for(lambda: ((kd.get("lhvolume", NS, v) or {}).get("status") or {}).get("lastBackup"),
-                        self.timeouts["transfer"], interval=5, what=f"first restore of {v}")
+            self.k[dst].wait_for(lambda: self._engine_restored(dst, v), self.timeouts["transfer"], interval=5,
+                                 what=f"first restore of {v}")
 
     # ── status ───────────────────────────────────────────────────────────────
     def volume_status(self, primary: str, replica: str, ns: str, vm: str, claims: List[str]) -> List[VolumeStatus]:
@@ -475,7 +473,9 @@ class LonghornBackend(StorageBackend):
             st = (kd.get("lhvolume", NS, v) or {}).get("status") or {}
             if not st.get("isStandby"):
                 raise ReplicationError(f"{dst}: Longhorn volume {v} is not a standby DR volume (it may already be activated).")
-            if not st.get("lastBackup"):
+            # status.lastBackup is set when a restore starts; only the engine proves one finished (seen in the lab:
+            # lastBackup set while the first 10 GiB restore was at 52%)
+            if not self._engine_restored(dst, v):
                 raise ReplicationError(f"{dst}: DR volume {v} has not restored any backup yet. Please wait for the first "
                                        f"restore, or check harvey replication status.")
 

@@ -129,6 +129,37 @@ def test_expand_plan_keeps_member_priorities():
     assert ("prod", "db", 100, 0) in plan and len(plan) == 2 and "recovery group app" in notes[0]
 
 
+def test_failover_refuses_when_destination_is_already_primary():
+    # the NetApp preflight accepts already-promoted volumes (to resume a half-done failover); this orchestrator
+    # guard is what keeps it from "failing over" onto the site that already is the primary
+    REGISTRY["recorder"] = _Recorder
+    _Recorder.calls = []
+    src = _ClusterKube("a", [_vm("web", ["web-root"], status="Stopped", role="replica")])
+    dst = _ClusterKube("b", [_vm("web", ["web-root"], role="primary")])
+    rep = Replicator({"a": src, "b": dst}, {"backend": "recorder"}, log=lambda *_: None)
+    rep.sync_metadata = lambda *a, **k: []
+    with pytest.raises(ReplicationError, match="already primary on b"):
+        rep.failover([("prod", "web", 0, 0)], "a", "b")
+    assert _Recorder.calls == []                     # refused before any backend call
+    del REGISTRY["recorder"]
+
+
+def test_failover_refuses_a_destination_that_was_not_reprotected():
+    # after a failover a -> b, a holds the old copy (harvey.io/needs-reprotect) until reprotect; failing over
+    # back onto it would start the VM on stale data
+    REGISTRY["recorder"] = _Recorder
+    _Recorder.calls = []
+    old = _vm("web", ["web-root"], status="Stopped", role="replica")
+    old[2]["metadata"]["annotations"]["harvey.io/needs-reprotect"] = "true"
+    rep = Replicator({"b": _ClusterKube("b", [_vm("web", ["web-root"], role="primary")]), "a": _ClusterKube("a", [old])},
+                     {"backend": "recorder"}, log=lambda *_: None)
+    rep.sync_metadata = lambda *a, **k: []
+    with pytest.raises(ReplicationError, match="run harvey reprotect first"):
+        rep.failover([("prod", "web", 0, 0)], "b", "a")
+    assert _Recorder.calls == []
+    del REGISTRY["recorder"]
+
+
 def test_reprotect_resumes_when_the_old_primary_vm_object_is_gone():
     """An interrupted reprotect deletes the old primary's VM before replacing its disks. A rerun must not stop on
     the missing VM: the backend reprotects the disks and the metadata sync recreates the replica VM."""
