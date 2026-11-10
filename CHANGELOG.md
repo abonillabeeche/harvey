@@ -45,6 +45,19 @@ Pluggable storage backends and Portworx async DR.
   namespace-scoped identity got HTTP 403 from the cluster-wide list)
 
 ### Fixed
+- **NetApp: TMR waits fail fast and scale.** A TMR whose status is `failed` for the current spec ends the wait at
+  once instead of after `timeouts.tmr` (a reprotect with the intercluster LIF down: 306 s → 13 s). Waits for several
+  disks use one LIST of the namespace's TMRs per poll instead of one GET per TMR. Failures are reported one line per
+  disk with Trident's message and remote volume, not as a raw condition dict of the first disk.
+- **NetApp: reprotect retries a failed reestablish once by itself**, then points to Trident's log for ONTAP's reason
+  (seen in the lab: right after the peering came back, a stale relationship's scheduled update made one resync fail).
+- **`harvey reprotect` with several VMs keeps going** after a failed VM and exits 1 at the end with the list,
+  instead of stopping at the first failure.
+- **Failover summary:** row labels name the clusters (not "DR" for the reverse direction); a failover with failures
+  shows "Elapsed (incomplete)" instead of "Total RTO"; VMs stopped on the source but not started on the destination
+  get a hint (rerun, finish with `--unplanned`, or start them on the source again). `plan run` exits 1 on failures.
+- **NetApp: RPO of a resumed failover.** `--unplanned` after a half-promoted failover reported RPO `unknown`; the
+  recovery point of an already-promoted volume is now read from its newest SnapMirror snapshot.
 - **Failover summaries show the phase of each failure again.** Rich read `[preflight]` as markup and dropped it,
   and a preflight refusal showed a `-` placeholder instead of a VM (`• - : …`). Failure lines are now escaped and
   read `• (preflight): …` or `• ns/vm (start): …`.

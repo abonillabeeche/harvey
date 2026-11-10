@@ -31,6 +31,14 @@ ANN_MIRROR = "trident.netapp.io/mirrorRelationship"
 _BUSY = ("transferring", "queued", "preparing", "finalizing")
 
 
+class TmrWaitError(ReplicationError):
+    """Some TMRs failed or didn't reach the wanted state; `failed` = names whose status is 'failed'."""
+
+    def __init__(self, message: str, failed: List[str]):
+        super().__init__(message)
+        self.failed = failed
+
+
 def tmr_condition(tmr: Optional[dict]) -> dict:
     if not tmr:
         return {}
@@ -88,18 +96,54 @@ class NetAppBackend(StorageBackend):
         return self._ontap_cache[key]
 
     def _wait_tmr(self, cluster: str, ns: str, name: str, states: Tuple[str, ...], need_handle: bool = True) -> dict:
-        k = self.k[cluster]
+        return self._wait_tmrs(cluster, ns, [name], states, need_handle)[name]
 
-        def ok():
-            c = tmr_condition(k.get("tmr", ns, name))
-            if c.get("state") in states and (c.get("localVolumeHandle") or not need_handle):
-                return c
-            return None
-        try:
-            return k.wait_for(ok, self.timeouts["tmr"], what=f"TMR {ns}/{name} -> {'/'.join(states)}")
-        except KubeError as e:
-            c = tmr_condition(k.get("tmr", ns, name))
-            raise ReplicationError(f"{e}; TMR condition: {c}") from e
+    def _wait_tmrs(self, cluster: str, ns: str, names: List[str], states: Tuple[str, ...],
+                   need_handle: bool = True, interval: float = 3.0) -> Dict[str, dict]:
+        """Waits until every TMR in `names` reports one of `states`; returns {name: condition}.
+
+        Scales with the number of disks: one LIST of the namespace's TMRs per poll (not one GET per TMR), so a
+        recovery group or a namespace with hundreds of disks costs the same number of API calls as one disk.
+        Fails fast: a TMR whose status is 'failed' for the current spec (observedGeneration caught up) won't
+        recover on its own, so there's no point in waiting for the timeout. Every failed or late TMR is reported,
+        one line per disk, with Trident's message."""
+        k = self.k[cluster]
+        pending, done, failed = list(dict.fromkeys(names)), {}, {}
+        conds: Dict[str, dict] = {}
+        deadline = time.time() + self.timeouts["tmr"]
+        while True:
+            try:
+                if len(pending) > 1:
+                    objs = {o["metadata"]["name"]: o for o in k.list("tmr", ns)}
+                else:
+                    objs = {pending[0]: k.get("tmr", ns, pending[0])}
+            except KubeError:
+                objs = None   # transient API error: keep the last known conditions and poll again
+            for n in list(pending):
+                if objs is None:
+                    break
+                o = objs.get(n)
+                c = conds[n] = tmr_condition(o)
+                if c.get("state") in states and (c.get("localVolumeHandle") or not need_handle):
+                    done[n] = c
+                    pending.remove(n)
+                elif c.get("state") == "failed" and \
+                        int(c.get("observedGeneration") or 0) >= int((o or {}).get("metadata", {}).get("generation") or 0):
+                    failed[n] = c
+                    pending.remove(n)
+            if not pending or time.time() >= deadline:
+                break
+            time.sleep(interval)
+        if failed or pending:
+            want = "/".join(states)
+            lines = [f"{cluster}: tmr/{n} failed: {failed[n].get('message') or 'no message'}"
+                     + (f" (remote {failed[n]['remoteVolumeHandle']})" if failed[n].get("remoteVolumeHandle") else "")
+                     for n in failed]
+            lines += [f"{cluster}: tmr/{n} still '{conds.get(n, {}).get('state', 'missing')}' after "
+                      f"{self.timeouts['tmr']}s (waiting for {want})"
+                      + (f": {conds[n]['message']}" if conds.get(n, {}).get("message") else "") for n in pending]
+            raise TmrWaitError("; ".join(lines), list(failed))
+        return done
 
     # ── protect ──────────────────────────────────────────────────────────────
     def protect(self, src: str, dst: str, ns: str, vm: str, claims: List[str], wait_init: bool) -> List[str]:
@@ -108,7 +152,6 @@ class NetAppBackend(StorageBackend):
         out = []
 
         # 1. source TMRs -> volume handles
-        handles = {}
         for c in claims:
             t = ks.get("tmr", ns, c)
             if t is None:
@@ -119,7 +162,7 @@ class NetAppBackend(StorageBackend):
             elif t["spec"].get("state") != "promoted":
                 raise ReplicationError(f"{src}: tmr/{c} is '{t['spec'].get('state')}', so {src} isn't the primary "
                                        f"for this volume.")
-            handles[c] = self._wait_tmr(src, ns, c, ("promoted",))["localVolumeHandle"]
+        handles = {c: cond["localVolumeHandle"] for c, cond in self._wait_tmrs(src, ns, claims, ("promoted",)).items()}
 
         # 2. destination TMRs + PVCs
         for c in claims:
@@ -314,8 +357,14 @@ class NetAppBackend(StorageBackend):
         for c in claims:
             try:
                 h = tmr_condition(self.k[dst].get("tmr", ns, c)).get("localVolumeHandle")
-                rp = snapshot_time(self.ontap_for_claim(dst, ns, c).relationship(h).get("exported_snapshot"))
-            except (ReplicationError, OntapError, KubeError, AttributeError):
+                if not h:
+                    return None
+                ontap = self.ontap_for_claim(dst, ns, c)
+                rel = ontap.relationship(h)
+                # no relationship = promoted by an earlier, interrupted failover: the volume still carries the
+                # last transferred snapshot, which is its recovery point
+                rp = snapshot_time(rel.get("exported_snapshot") if rel else ontap.newest_snapmirror_snapshot(h))
+            except (ReplicationError, OntapError, KubeError):
                 return None
             if not rp:
                 return None
@@ -392,26 +441,50 @@ class NetAppBackend(StorageBackend):
                     dst_c.get("remoteVolumeHandle") == src_c["localVolumeHandle"]:
                 out.append(f"{new_dst}: tmr/{c} already {dst_c['state']}")
                 continue
-            if t["spec"].get("state") == "reestablished" and dst_c.get("state") != "reestablishing":
-                # Trident only reconciles on a spec change: re-sending the same failed spec would do nothing, so step
-                # through promoted (the volume is not mirrored at this point) and ask again
-                kd.merge_patch("tmr", ns, c, {"spec": {"state": "promoted"}})
-                self._wait_tmr(new_dst, ns, c, ("promoted",), need_handle=False)
-                out.append(f"{new_dst}: tmr/{c} was {dst_c.get('state')}: retrying the reestablish")
-                t = kd.get("tmr", ns, c)
-            vmap = t["spec"]["volumeMappings"][0]
-            vmap["remoteVolumeHandle"] = src_c["localVolumeHandle"]
-            patch = {"spec": {"state": "reestablished", "volumeMappings": [vmap]}}
-            if not t["spec"].get("replicationPolicy"):
-                patch["spec"]["replicationPolicy"] = self.policy
-            if not t["spec"].get("replicationSchedule"):
-                patch["spec"]["replicationSchedule"] = self.schedule
-            kd.merge_patch("tmr", ns, c, patch)
-            out.append(f"{new_dst}: tmr/{c} -> reestablished <- {src_c['localVolumeHandle']}")
-        for c in claims:
-            self._wait_tmr(new_dst, ns, c, ("reestablished", "established"))
+            out += self._request_reestablish(new_dst, ns, c, src_c["localVolumeHandle"], t)
+        try:
+            try:
+                self._wait_tmrs(new_dst, ns, claims, ("reestablished", "established"))
+            except TmrWaitError as e:
+                if not e.failed:
+                    raise
+                # one automatic retry: a resync can fail on a transient ONTAP state (seen in the lab: the relationship
+                # left by an earlier failed resync hit its 5-minute schedule, "must be a data-protection volume")
+                self.log(f"  [yellow]{e}; retrying the reestablish once[/yellow]")
+                for c in e.failed:
+                    src_h = tmr_condition(ks.get("tmr", ns, c))["localVolumeHandle"]
+                    self._request_reestablish(new_dst, ns, c, src_h, kd.get("tmr", ns, c))
+                self._wait_tmrs(new_dst, ns, e.failed, ("reestablished", "established"))
+        except ReplicationError as e:
+            raise ReplicationError(f"{e}. Please check that {new_dst}'s ONTAP can reach {new_src}'s (cluster and "
+                                   f"SVM peering, intercluster LIFs); ONTAP's own reason is in Trident's log "
+                                   f"(kubectl -n trident logs deploy/trident-controller -c trident-main | grep "
+                                   f"'Could not reestablish'). Then run harvey reprotect again: it retries the failed "
+                                   f"volumes.") from e
         if wait_init:
             self.wait_initialized(new_src, new_dst, ns, vm, claims)
+        return out
+
+    def _request_reestablish(self, new_dst: str, ns: str, c: str, src_handle: str, t: dict) -> List[str]:
+        """Sets the TMR to reestablished (reverse resync from src_handle). A failed earlier attempt is stepped
+        through promoted first: Trident only reconciles on a spec change, so re-sending the same failed spec would
+        do nothing (the volume isn't mirrored at this point)."""
+        kd, out = self.k[new_dst], []
+        dst_c = tmr_condition(t)
+        if t["spec"].get("state") == "reestablished" and dst_c.get("state") != "reestablishing":
+            kd.merge_patch("tmr", ns, c, {"spec": {"state": "promoted"}})
+            self._wait_tmr(new_dst, ns, c, ("promoted",), need_handle=False)
+            out.append(f"{new_dst}: tmr/{c} was {dst_c.get('state')}: retrying the reestablish")
+            t = kd.get("tmr", ns, c)
+        vmap = t["spec"]["volumeMappings"][0]
+        vmap["remoteVolumeHandle"] = src_handle
+        patch = {"spec": {"state": "reestablished", "volumeMappings": [vmap]}}
+        if not t["spec"].get("replicationPolicy"):
+            patch["spec"]["replicationPolicy"] = self.policy
+        if not t["spec"].get("replicationSchedule"):
+            patch["spec"]["replicationSchedule"] = self.schedule
+        kd.merge_patch("tmr", ns, c, patch)
+        out.append(f"{new_dst}: tmr/{c} -> reestablished <- {src_handle}")
         return out
 
     def unprotect(self, primary: str, replica: str, ns: str, vm: str, claims: List[str]) -> List[str]:

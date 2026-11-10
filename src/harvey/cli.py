@@ -514,22 +514,24 @@ def _execute_failover_plan(
             "rpo": r.rpo, "phases": r.phases, "synced": r.synced, "promoted": r.promoted}
 
 
-def _print_failover_summary(result: dict):
+def _print_failover_summary(result: dict, source: Optional[str] = None, destination: Optional[str] = None):
     rto = result.get("rto_seconds")
     console.rule("[bold green]Failover Complete[/bold green]" if not result["failed"]
                  else "[bold yellow]Failover finished with errors[/bold yellow]")
     t = Table(title="Failover Summary", box=box.ROUNDED)
     t.add_column("Metric", style="bold")
     t.add_column("Value", justify="right")
-    t.add_row("[blue]VMs stopped on source[/blue]", str(len(result["stopped"])))
+    t.add_row(f"[blue]VMs stopped on {escape(source or 'source')}[/blue]", str(len(result["stopped"])))
     t.add_row("[magenta]Volumes final-synced[/magenta]", str(len(result.get("synced", []))))
-    t.add_row("[green]VMs started on DR[/green]", str(len(result["started"])))
+    t.add_row(f"[green]VMs started on {escape(destination or 'destination')}[/green]", str(len(result["started"])))
     if result["failed"]:
         t.add_row("[red]Failures[/red]", str(len(result["failed"])))
     for phase, secs in (result.get("phases") or {}).items():
         t.add_row(f"[dim]  {phase}[/dim]", f"{secs}s")
     if rto is not None:
-        t.add_row("[cyan]Total RTO[/cyan]", f"{rto}s  ({rto // 60}m {rto % 60}s)")
+        # an RTO only means something for a failover that brought every VM back
+        label = "Total RTO" if not result["failed"] else "Elapsed (incomplete)"
+        t.add_row(f"[cyan]{label}[/cyan]", f"{rto}s  ({rto // 60}m {rto % 60}s)")
     for vm, rpo in (result.get("rpo") or {}).items():
         t.add_row(f"[cyan]RPO {vm}[/cyan]",
                   "0s (lossless)" if rpo == 0 else ("unknown" if rpo is None else f"≤ {rpo}s"))
@@ -537,6 +539,23 @@ def _print_failover_summary(result: dict):
     for vm, phase, err in result["failed"]:
         who = "" if vm in (None, "", "-") else f"{escape(str(vm))} "
         console.print(f"  [red]• {who}({escape(str(phase))}): {escape(str(err))}[/red]", soft_wrap=True)
+    if source and destination:
+        _print_stranded_hint(result, source, destination)
+
+
+def _print_stranded_hint(result: dict, source: str, destination: str):
+    """VMs that were stopped on the source but never started on the destination are down on both sites."""
+    started = set(result.get("started") or [])
+    stranded = [f"{ns}/{vm}" for ns, vm in result.get("stopped") or [] if f"{ns}/{vm}" not in started]
+    if not stranded:
+        return
+    console.print(f"\n[bold yellow]{len(stranded)} VM(s) are stopped on {escape(source)} and weren't started on "
+                  f"{escape(destination)}: {escape(', '.join(stranded[:10]))}"
+                  f"{' …' if len(stranded) > 10 else ''}[/bold yellow]", soft_wrap=True)
+    console.print(f"Please fix the cause above, then either run the same failover again, finish it with "
+                  f"[bold cyan]--unplanned[/bold cyan] (promotes the last replicated data, which can lose the writes "
+                  f"since the last transfer), or start the VMs on {escape(source)} again (its disks are still the "
+                  f"primary copy).", soft_wrap=True)
 
 
 
@@ -625,7 +644,7 @@ def _ad_hoc_failover(
     if dry_run:
         _save_plan_from_dry_run(plan, source, destination)
         return
-    _print_failover_summary(result)
+    _print_failover_summary(result, source, destination)
     _audit("failover_completed", {
         "source": source, "destination": destination, "unplanned": unplanned,
         "started": len(result["started"]), "failed": len(result["failed"]),
@@ -1426,18 +1445,24 @@ def reprotect(
     config = load_config()
     a, b = resolve_pair(config, source, destination)
     rep = make_replicator(config, [a, b])
+    failed = []
     for label, vm, grp in _units_to_run(rep, [a, b], namespace, vm_names, group, "reprotect"):
-        p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
-        if not yes and not Confirm.ask(f"Reverse-resync {label}: {p} → {r} (overwrites {r}'s disks)?"):
-            continue
         try:
+            p, r = _pair_for_unit(rep, namespace, vm, grp, a, b)
+            if not yes and not Confirm.ask(f"Reverse-resync {label}: {p} → {r} (overwrites {r}'s disks)?"):
+                continue
             for line in rep.reprotect(namespace, vm, p, r, wait_init=wait, group=grp):
                 console.print(f"  {line}")
             _audit("vm_reprotected", {"namespace": namespace, "vm": vm, "group": grp, "primary": p, "replica": r})
             console.print(f"  [green]✓ {label} replicating {p} → {r}[/green]")
         except ERRORS as e:
-            console.print(f"  [bold red]✗ {e}[/bold red]")
-            raise typer.Exit(1)
+            # keep going: one VM whose peering is broken must not leave the rest of a namespace unprotected
+            failed.append(label)
+            console.print(f"  [bold red]✗ {escape(label)}: {escape(str(e))}[/bold red]", soft_wrap=True)
+    if failed:
+        console.print(f"\n[bold red]{len(failed)} reprotect(s) failed: {escape(', '.join(failed[:10]))}"
+                      f"{' …' if len(failed) > 10 else ''}[/bold red]", soft_wrap=True)
+        raise typer.Exit(1)
 
 
 # ── failback ──────────────────────────────────────────────────────────────────
@@ -1761,12 +1786,14 @@ def plan_run(
                                     unplanned=unplanned, force=force)
 
     if not dry_run:
-        _print_failover_summary(result)
+        _print_failover_summary(result, source, destination)
         _audit("plan_run_completed", {
             "plan": name, "source": source, "destination": destination, "unplanned": unplanned,
             "started": len(result["started"]), "failed": len(result["failed"]),
             "rto_seconds": result.get("rto_seconds"), "rpo": result.get("rpo"),
         })
+        if result["failed"]:
+            raise typer.Exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

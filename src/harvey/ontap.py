@@ -119,6 +119,19 @@ class OntapClient:
         recs = d.get("records", [])
         return recs[0].get("type") if recs else None
 
+    def newest_snapmirror_snapshot(self, handle: str) -> Optional[str]:
+        """Name of the newest SnapMirror snapshot on 'svm:volume' (None if none). After a break the relationship
+        can be gone, but the volume keeps the last transferred snapshot: its timestamp is the recovery point."""
+        svm, vol = handle.split(":", 1)
+        d = self._req("GET", "storage/volumes", params={"svm.name": svm, "name": vol, "fields": "uuid"})
+        recs = d.get("records", [])
+        if not recs:
+            return None
+        d = self._req("GET", f"storage/volumes/{recs[0]['uuid']}/snapshots",
+                      params={"name": "snapmirror.*", "fields": "name,create_time"})
+        snaps = sorted(d.get("records", []), key=lambda s: s.get("create_time") or "")
+        return snaps[-1]["name"] if snaps else None
+
     def _wait_job(self, response: dict, what: str, timeout_s: int):
         """Waits for the job an ONTAP call returned (no job = already done)."""
         job = (response.get("job") or {}).get("uuid")

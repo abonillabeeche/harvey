@@ -51,6 +51,7 @@ Harvey adds nothing here:
   | `PATCH /api/snapmirror/relationships/{uuid}` (`paused`, `broken_off`, `snapmirrored`) | quiesce + break when Trident left a volume DP, restart a stalled baseline |
   | `GET /api/storage/volumes` | check that a promoted volume really is read-write |
   | `GET /api/cluster/jobs/{uuid}` | wait for the job of a quiesce or break and report its error |
+  | `GET /api/storage/volumes/{uuid}/snapshots` | recovery point of a volume an interrupted failover already promoted |
 
   The login needs the `http` application (ONTAP REST) enabled, which Trident's REST mode already requires.
 - [ ] **Backends defined as `TridentBackendConfig` objects with a username/password Secret.** Harvey finds a PVC's
@@ -143,6 +144,12 @@ about the behavior.
 `harvey reprotect` sets the old source's TMR to `reestablished`, with `remoteVolumeHandle` = the new primary's
 volume. That is a **reverse resync**: only changed blocks travel, so failback stays cheap even for large disks.
 `harvey failback` = planned failover back + reprotect.
+
+If a reestablish fails (Trident reports the TMR `failed`, e.g. while the peering is down), Harvey stops waiting at
+once, retries that volume once, and then reports each failed disk. ONTAP's own reason is only in Trident's log
+(`kubectl -n trident logs deploy/trident-controller -c trident-main | grep 'Could not reestablish'`). Once the
+cause is fixed, `harvey reprotect` again retries the failed volumes. With several VMs, a failed VM doesn't stop the
+others; the command exits 1 at the end.
 
 ### Replication status
 
