@@ -22,7 +22,7 @@ class Rep:
         return "a", "b"
 
     def unit(self, cluster, ns, vm):
-        return type("U", (), {"vms": [vm]})()
+        return type("U", (), {"vms": [vm], "group": None})()   # an ungrouped VM
 
 
 @pytest.fixture
