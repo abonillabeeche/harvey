@@ -100,9 +100,9 @@ def test_detect_backend_rejects_unsupported_and_mixed():
                        ("pvc", "demo", _pvc("d1", "demo", "pv2")), ("pv", None, _pv("pv2", "pxd.portworx.com")),
                        ("pvc", "demo", _pvc("d2", "demo", "pv3")), ("pv", None, _pv("pv3", "csi.trident.netapp.io"))])
     rep = Replicator({"a": k}, {}, log=lambda *_: None)
-    with pytest.raises(ReplicationError, match="no Harvey storage backend"):
+    with pytest.raises(ReplicationError, match="which no Harvey storage backend replicates"):
         rep.detect_backend("a", "demo", _vm(claims=("r",)))
-    with pytest.raises(ReplicationError, match="mixes storage backends"):
+    with pytest.raises(ReplicationError, match="uses more than one storage backend"):
         rep.detect_backend("a", "demo", _vm(claims=("d1", "d2")))
 
 
@@ -349,7 +349,7 @@ def test_lh_wait_restored_rejects_an_older_backup(monkeypatch):
     import harvey.backends.longhorn as lh
     monkeypatch.setattr(lh.time, "sleep", lambda *_: None)
     be = LonghornBackend({"b": _lh_dr_with_backups("backup-old")}, {}, {"transfer": 0.2}, lambda *_: None)
-    with pytest.raises(ReplicationError, match="did not restore backup backup-new"):
+    with pytest.raises(ReplicationError, match="didn't restore backup backup-new"):
         be.wait_restored("b", "pvc-123", "backup-new")
 
 

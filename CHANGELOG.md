@@ -30,6 +30,10 @@ Pluggable storage backends and Portworx async DR.
 - `replication status` shows the backend; config sections `replication.netapp` and `replication.portworx`
 
 ### Changed
+- **Clearer, more courteous messages.** Errors, warnings and hints now say what's wrong and then what to do
+  ("Please name the group explicitly", "Please stop it first, because reprotect overwrites its disks"),
+  in full sentences, without blunt imperatives or all-caps. The Longhorn V2 warning now recommends Longhorn
+  1.13.1 or later instead of calling V2 untested.
 - NetApp logic moved to `backends/netapp.py` without behaviour changes; 0.2 configs (top-level
   `replication.policy` / `schedule`) still work
 - `health-check` and `replication status` ignore VMs protected towards a third cluster

@@ -76,7 +76,7 @@ class LonghornBackend(StorageBackend):
         k = self.k[cluster]
         pvc = k.get("pvc", ns, claim)
         if not pvc or not pvc["spec"].get("volumeName"):
-            raise ReplicationError(f"{cluster}: PVC {ns}/{claim} not bound")
+            raise ReplicationError(f"{cluster}: PVC {ns}/{claim} isn't bound to a volume yet.")
         pv = k.get("pv", None, pvc["spec"]["volumeName"])
         return pv["spec"]["csi"]["volumeHandle"]
 
@@ -90,11 +90,11 @@ class LonghornBackend(StorageBackend):
         bt = self.k[cluster].get("lhbackuptarget", NS, self.target)
         if bt is None:
             raise ReplicationError(
-                f"{cluster}: Longhorn BackupTarget '{self.target}' not found. Create the same BackupTarget (same URL "
-                f"and credentials) on both clusters, see docs/longhorn.md")
+                f"{cluster}: Longhorn BackupTarget '{self.target}' not found. Please create a BackupTarget with this name, "
+                f"the same URL and working credentials on both clusters (see docs/longhorn.md).")
         if not (bt.get("status") or {}).get("available"):
-            raise ReplicationError(f"{cluster}: Longhorn BackupTarget '{self.target}' is not available: "
-                                   f"{(bt.get('status') or {}).get('conditions')}")
+            raise ReplicationError(f"{cluster}: Longhorn BackupTarget '{self.target}' isn't available "
+                                   f"({(bt.get('status') or {}).get('conditions')}). Please check its URL and credentials.")
         return bt["spec"].get("backupTargetURL")
 
     def _backup_volume(self, cluster: str, volume: str) -> Optional[dict]:
@@ -165,8 +165,8 @@ class LonghornBackend(StorageBackend):
                 raise ReplicationError(f"{cluster}: backup {bname} of {volume} failed: "
                                        f"{(b.get('status') or {}).get('error')}")
             time.sleep(3)
-        raise ReplicationError(f"{cluster}: backup {bname} of {volume} not completed after "
-                               f"{self.timeouts['transfer']}s")
+        raise ReplicationError(f"{cluster}: backup {bname} of {volume} didn't complete within "
+                               f"{self.timeouts['transfer']}s.")
 
     def wait_restored(self, dst: str, volume: str, backup: str):
         """Wait until the DR volume on dst has restored `backup` (polls the backup volume sync)."""
@@ -188,12 +188,12 @@ class LonghornBackend(StorageBackend):
                             if c.get("type") == "Restore" and c.get("status") == "False" and c.get("message")), "")
                 raise ReplicationError(
                     f"{dst}: DR volume {volume} is faulted{f' ({why})' if why else ''}. Longhorn V2 DR volumes before "
-                    f"1.13.1 / 1.12.2 fault on a backupstore lock conflict instead of retrying (longhorn#14085); "
-                    f"rerun the command to replace it with a new DR volume")
+                    f"1.13.1 and 1.12.2 fault on a backup-store lock conflict instead of retrying (longhorn#14085). "
+                    f"Please rerun the command to replace it with a new DR volume.")
             time.sleep(5)
-        raise ReplicationError(f"{dst}: DR volume {volume} did not restore backup {backup} within "
-                               f"{self.timeouts['transfer']}s (last restored: "
-                               f"{((k.get('lhvolume', NS, volume) or {}).get('status') or {}).get('lastBackup')})")
+        raise ReplicationError(f"{dst}: DR volume {volume} didn't restore backup {backup} within "
+                               f"{self.timeouts['transfer']}s (latest backup: "
+                               f"{((k.get('lhvolume', NS, volume) or {}).get('status') or {}).get('lastBackup')}).")
 
     def wait_backup_visible(self, dst: str, volume: str, backup: str, block_size: Optional[str] = None):
         """Longhorn's admission webhook needs the Backup CR on the DR cluster before a DR volume can reference it,
@@ -227,8 +227,8 @@ class LonghornBackend(StorageBackend):
                              f"{block_size or 2097152} (synced backups carry -1)[/yellow]")
                 return
             time.sleep(3)
-        raise ReplicationError(f"{dst}: backup {backup} not visible through BackupTarget '{self.target}' after "
-                               f"{self.timeouts['transfer']}s")
+        raise ReplicationError(f"{dst}: backup {backup} isn't visible through BackupTarget '{self.target}' after "
+                               f"{self.timeouts['transfer']}s. Please check that both clusters can reach the target.")
 
     def _engine_restored(self, cluster: str, volume: str) -> Optional[str]:
         """The backup the volume's engine reports as restored. The volume's status.lastBackup only says which
@@ -287,12 +287,12 @@ class LonghornBackend(StorageBackend):
             raise ReplicationError(
                 f"{dst}: Longhorn volume {volume} (V1) is built on backing image '{s['backingImage']}', which doesn't "
                 f"exist on {dst} under that name. Harvester names backing images after the image UID, so importing or "
-                f"restoring the image in Harvester creates a different name. Restore the backing image on {dst} as a "
-                f"Longhorn BackingImage named '{s['backingImage']}' (sourceType: restore), or use CDI-backed images. "
-                f"See docs/longhorn.md")
+                f"restoring the image in Harvester creates a different name. Please restore the backing image on {dst} "
+                f"as a Longhorn BackingImage named '{s['backingImage']}' (sourceType: restore), or use CDI-backed "
+                f"images (see docs/longhorn.md).")
         if s.get("dataEngine") == "v2":
-            self.log(f"  [yellow]{claim}: Longhorn V2 data engine: DR volumes are supported by Longhorn 1.12+ but "
-                     f"untested with Harvey (V2 is alpha)[/yellow]")
+            self.log(f"  [yellow]{claim}: Longhorn V2 data engine. Longhorn 1.13.1 or later is recommended: earlier "
+                     f"versions can fault V2 DR volumes (longhorn#14085).[/yellow]")
         pv_t, pvc_t = self._templates(src, ns, claim)
         body = {"apiVersion": API, "kind": "Volume",
                 "metadata": {"name": volume, "namespace": NS,
@@ -328,8 +328,8 @@ class LonghornBackend(StorageBackend):
             name = v["metadata"]["name"]
             status = (v.get("status") or {}).get("printableStatus")
             if status not in ("Stopped", "Halted"):
-                raise ReplicationError(f"{cluster}: VM {ns}/{name} is {status}; it must be stopped before disk "
-                                       f"{claim} is replaced")
+                raise ReplicationError(f"{cluster}: VM {ns}/{name} is {status}. Please stop it before Harvey replaces "
+                                       f"disk {claim}.")
             k.delete("vm", ns, name, propagation="Orphan")
             k.wait_for(lambda: k.get("vm", ns, name) is None, self.timeouts["tmr"], what=f"VM {ns}/{name} removal")
             out.append(f"{cluster}: vm/{name} removed (stopped replica; recreated from the new primary below)")
@@ -365,14 +365,15 @@ class LonghornBackend(StorageBackend):
         self.check_claims(src, ns, claims)
         u1, u2 = self._check_target(src), self._check_target(dst)
         if u1 != u2:
-            raise ReplicationError(f"BackupTarget '{self.target}' points at different places: {src}={u1}, "
-                                   f"{dst}={u2}")
+            raise ReplicationError(f"BackupTarget '{self.target}' points to different locations ({src}: {u1}, "
+                                   f"{dst}: {u2}). Please use the same URL on both clusters.")
         out = [f"backup target '{self.target}': {u1}"]
         vols = {c: self._volume_name(src, ns, c) for c in claims}
         for c, v in vols.items():
             existing = kd.get("lhvolume", NS, v)
             if existing is not None and not (existing["metadata"].get("labels") or {}).get(L_MANAGED):
-                raise ReplicationError(f"{dst}: a Longhorn volume named {v} already exists and isn't Harvey's")
+                raise ReplicationError(f"{dst}: a Longhorn volume named {v} already exists and wasn't created by Harvey. "
+                                       f"Please check what uses it before protecting this VM.")
         for c, v in vols.items():
             self._schedule_backups(src, v)
             out.append(f"{src}: volume {v} → backups to '{self.target}' every {self.interval} min")
@@ -469,13 +470,14 @@ class LonghornBackend(StorageBackend):
         for c in claims:
             v = self._dr_volume_name(ns, c, dst)
             if not v:
-                raise ReplicationError(f"{dst}: no Harvey DR volume for {ns}/{c} — is {ns}/{vm} protected "
-                                       f"{src} -> {dst}?")
+                raise ReplicationError(f"{dst}: no Harvey DR volume found for {ns}/{c}. Is {ns}/{vm} protected from "
+                                       f"{src} to {dst}?")
             st = (kd.get("lhvolume", NS, v) or {}).get("status") or {}
             if not st.get("isStandby"):
-                raise ReplicationError(f"{dst}: Longhorn volume {v} is not a standby DR volume")
+                raise ReplicationError(f"{dst}: Longhorn volume {v} is not a standby DR volume (it may already be activated).")
             if not st.get("lastBackup"):
-                raise ReplicationError(f"{dst}: DR volume {v} has not restored any backup yet")
+                raise ReplicationError(f"{dst}: DR volume {v} has not restored any backup yet. Please wait for the first "
+                                       f"restore, or check harvey replication status.")
 
     def final_sync(self, src: str, dst: str, ns: str, vm: str, claims: List[str],
                    not_before: datetime.datetime) -> List[Tuple[str, int, float]]:
