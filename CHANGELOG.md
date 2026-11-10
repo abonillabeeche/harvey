@@ -49,6 +49,8 @@ Pluggable storage backends and Portworx async DR.
   (full) restore was restored instead, so the wait never matched and reprotect timed out half way. Waits now
   accept the requested backup or a newer one, recurring backups start after the restore is confirmed, and a
   rerun reuses the DR volumes an interrupted reprotect already created.
+- `plan run --test`: Harvester and KubeVirt accept the shadow VM (no copied MACs, no `spec.running` next to
+  `runStrategy`, no `harvey.io/*` labels or `dataVolumeTemplates`); `--yes` skips the confirmation
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and
   under-reported the loss by the transfer time)
 

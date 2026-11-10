@@ -1,5 +1,9 @@
 import datetime
 
+import pytest
+from typer.testing import CliRunner
+
+import harvey.cli as cli
 from harvey.ontap import parse_iso_duration, snapshot_time
 from harvey.replication import (A_RUN, L_ROLE, build_replica_vm, original_run_strategy, vm_claims,
                                 vm_configmap_names, vm_nads, vm_secret_names)
@@ -66,6 +70,36 @@ def test_replica_is_halted_and_clean():
     assert vols["data"] == {"name": "data", "persistentVolumeClaim": {"claimName": "db-1-dv"}}
     # MACs travel with the spec
     assert r["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"][0]["macAddress"] == "02:00:00:00:00:01"
+
+
+@pytest.mark.parametrize("run", [{"runStrategy": "Halted"}, {"running": True}])
+def test_shadow_vm_is_halted_and_clean(run):
+    vm = _vm()
+    del vm["spec"]["runStrategy"]
+    vm["spec"].update(run)
+    vm["metadata"]["annotations"][A_RUN] = "RerunOnFailure"
+    s = cli._build_shadow_vm_spec(vm, "prod-harvey-test")
+    spec, md = s["spec"], s["metadata"]
+    # KubeVirt: "spec.running: Running and RunStrategy are mutually exclusive"
+    assert "running" not in spec and spec["runStrategy"] == "Halted"
+    assert "dataVolumeTemplates" not in spec
+    vols = {v["name"]: v for v in spec["template"]["spec"]["volumes"]}
+    assert vols["data"] == {"name": "data", "persistentVolumeClaim": {"claimName": "db-1-dv"}}
+    # Harvester: "duplicate mac address present for vm ..." (the replica keeps the MAC)
+    assert "macAddress" not in spec["template"]["spec"]["domain"]["devices"]["interfaces"][0]
+    assert not [k for k in {**md["labels"], **md["annotations"]} if k.startswith("harvey.io/")]
+    assert md["labels"]["app"] == "db" and md["labels"]["harvey-test"] == "true"
+
+
+def test_plan_run_test_yes_does_not_prompt(monkeypatch, tmp_path):
+    (tmp_path / "p.yaml").write_text("name: p\nsource: a\ndestination: b\nprotection_groups: []\n")
+    monkeypatch.setattr(cli, "PLANS_DIR", tmp_path)
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: pytest.fail("prompted although --yes was given"))
+    monkeypatch.setattr(cli, "load_config", lambda: {})
+    monkeypatch.setattr(cli, "get_clients", lambda *a: (None, None))
+    monkeypatch.setattr(cli, "_audit", lambda *a, **k: None)
+    r = CliRunner().invoke(cli.app, ["plan", "run", "p", "--test", "--yes"])
+    assert r.exit_code == 0, r.output
 
 
 def test_original_run_strategy():
