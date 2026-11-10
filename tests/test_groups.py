@@ -127,3 +127,28 @@ def test_expand_plan_keeps_member_priorities():
     k.objs[("vm", "prod", "db")]["metadata"]["labels"]["failover-priority"] = "100"
     plan, notes = Replicator({"b": k}, {}, log=print).expand_plan([("prod", "web", 10, 0)], "b")
     assert ("prod", "db", 100, 0) in plan and len(plan) == 2 and "recovery group app" in notes[0]
+
+
+def test_reprotect_resumes_when_the_old_primary_vm_object_is_gone():
+    """An interrupted reprotect deletes the old primary's VM before replacing its disks. A rerun must not stop on
+    the missing VM: the backend reprotects the disks and the metadata sync recreates the replica VM."""
+    class _ReprotectRecorder(_Recorder):
+        def reprotect(self, new_src, new_dst, ns, vm, claims, wait_init):
+            self.calls.append(("reprotect", vm, tuple(claims)))
+            return []
+    REGISTRY["recorder"] = _ReprotectRecorder
+    _Recorder.calls = []
+    new_src = _ClusterKube("b", [_vm("app", ["app-root"], role="primary")])
+    old_primary = _ClusterKube("a")                              # its VM object was already removed
+    rep = Replicator({"a": old_primary, "b": new_src}, {"backend": "recorder"}, log=lambda *_: None)
+    synced = []
+    def fake_sync(ns, m, s, d, **k):                             # the real sync applies the replica VM
+        synced.append((m, s, d))
+        old_primary.create("vm", ns, {"metadata": {"name": m, "namespace": ns, "annotations": {}}})
+        return [f"vm/{m} created (Halted)"]
+    rep.sync_metadata = fake_sync
+    out = rep.reprotect("prod", "app", "b", "a")
+    assert _Recorder.calls == [("reprotect", "app", ("app-root",))]
+    assert synced == [("app", "b", "a")]
+    assert any("no VM object" in line for line in out)
+    del REGISTRY["recorder"]

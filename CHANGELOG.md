@@ -36,6 +36,11 @@ Pluggable storage backends and Portworx async DR.
 - Portworx selects PVCs by `harvey.io/protection-unit` (was `harvey.io/vm`, which a shared disk overwrote)
 
 ### Fixed
+- **Longhorn reprotect could wait forever**: it scheduled the new primary's recurring backups first, and the
+  waits required the DR volume to restore exactly Harvey's backup. A scheduled backup that landed during the
+  (full) restore was restored instead, so the wait never matched and reprotect timed out half way. Waits now
+  accept the requested backup or a newer one, recurring backups start after the restore is confirmed, and a
+  rerun reuses the DR volumes an interrupted reprotect already created.
 - Portworx unplanned RPO uses the migration trigger time (the PVC `migrationTime` is the apply time and
   under-reported the loss by the transfer time)
 

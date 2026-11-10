@@ -591,7 +591,11 @@ class Replicator:
             vm = self._get_vm(new_src, ns, m)
             if (vm["metadata"].get("labels") or {}).get(L_ROLE) != "primary":
                 raise ReplicationError(f"{ns}/{m} is not primary on {new_src}")
-            dvm = self._get_vm(new_dst, ns, m)
+            dvm = self._get_vm(new_dst, ns, m, required=False)
+            if dvm is None:
+                # an earlier reprotect removed it before replacing the disks; the metadata sync below recreates it
+                out.append(f"{new_dst}: {m}: no VM object (an interrupted reprotect removed it); recreating it")
+                continue
             if vm_status(dvm) not in ("Stopped", "Halted"):
                 raise ReplicationError(f"{ns}/{m} is {vm_status(dvm)} on {new_dst}; it must be stopped "
                                        f"(its disks will be overwritten)")

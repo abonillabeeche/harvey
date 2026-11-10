@@ -375,6 +375,15 @@ Upgrade with `uv tool upgrade harvey`. Prefer pipx? Use
 [Releases page](https://github.com/abonillabeeche/harvey/releases) (`uv tool install harvey-X.Y.Z-py3-none-any.whl`).
 From source: `git clone … && cd harvey && pip install .`
 
+A git install is pinned to the commit it was installed from and isn't updated by itself: run
+`uv tool upgrade harvey` to pick up new commits. For development, install the checkout as an editable tool so
+the `harvey` on your PATH always runs your working tree, from any directory:
+
+```bash
+uv tool install --force --editable .        # from the root of the checkout
+uv run --with pytest pytest -q tests         # run the test suite
+```
+
 ### Requirements
 
 - Two SUSE Virtualization (Harvester) or KubeVirt clusters, reachable from where you run Harvey through a
